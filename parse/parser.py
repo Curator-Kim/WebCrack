@@ -1,8 +1,7 @@
-from urllib.parse import urlparse
+from urllib.parse import urljoin
 from conf.config import *
 import requests
 from bs4 import BeautifulSoup as BS
-import re
 from generator.header import get_random_headers
 import logs.log as Log
 from requests.packages.urllib3.exceptions import InsecureRequestWarning
@@ -43,6 +42,7 @@ class Parser:
         res = requests.get(self.url, timeout=crackConfig["timeout"], verify=False, headers=get_random_headers(),
                            proxies=self.requests_proxies)
         res.encoding = res.apparent_encoding
+        self.response_url = res.url
         self.resp_content = res.text
 
     def cms_parser(self):
@@ -55,14 +55,22 @@ class Parser:
                 self.cms = cms
 
     def form_parser(self):
-        html = self.resp_content
-        result = re.findall(".*<form (.*)</form>.*", html, re.S)
-        if result:
-            form_data = '<form ' + result[0] + ' </form>'
-            form_soup = BS(form_data, "lxml")
-            self.form_content = form_soup.form
-        else:
-            raise Exception("Can not get form")
+        soup = BS(self.resp_content, "lxml")
+        forms = soup.find_all("form")
+        if not forms:
+            raise ValueError("No form found")
+        # 优先含密码输入框的表单，其次同时含用户名、密码命名的表单。
+        for form in forms:
+            if form.find("input", attrs={"type": lambda value: value and value.lower() == "password"}):
+                self.form_content = form
+                return
+        for form in forms:
+            names = [field.get("name", "").lower() for field in form.find_all("input")]
+            if (any(any(key in name for key in parserConfig["username_keyword_list"]) for name in names)
+                    and any(any(key in name for key in parserConfig["password_keyword_list"]) for name in names)):
+                self.form_content = form
+                return
+        self.form_content = forms[0]
 
     def check_login_page(self):
         login_keyword_list = parserConfig["login_keyword_list"]
@@ -78,30 +86,9 @@ class Parser:
                 raise Exception(f"{captcha} in login page")
 
     def post_path_parser(self):
-        url = self.url
-        content = self.form_content
-        form_action = str(content).split('\n')[0]
-        soup = BS(form_action, "lxml")
-        res = urlparse(url)
-        try:
-            action_path = soup.form['action']
-        except:
-            self.post_path = url  # 当form中没有action字段时，默认地址为url
-            return
-
-        if action_path.startswith('http'):  # action为绝对路径
-            path = action_path
-        elif action_path.startswith('/'):  # action为根路径
-            root_path = res.scheme + '://' + res.netloc
-            path = root_path + action_path
-        elif action_path == '':  # action为空
-            path = url
-        else:  # action为同目录下相对路径
-            relative_path = url.rstrip(url.split('/')[-1])
-            path = relative_path + action_path
-        if not path:
-            raise Exception("Can not get post path")
-        self.post_path = path
+        base_url = getattr(self, "response_url", self.url)
+        action = self.form_content.get("action", "").strip()
+        self.post_path = urljoin(base_url, action) if action else base_url
 
     def param_parser(self):
         content = self.form_content
