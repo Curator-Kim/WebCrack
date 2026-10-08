@@ -2,3 +2,9 @@
 /logs/20*
 *.pyc
 *test*
+*url.txt*
+*urls.txt*
+/output.txt
+/checks/local_results/
+/checks/json_results/
+__pycache__/

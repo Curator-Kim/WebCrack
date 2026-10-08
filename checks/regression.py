@@ -2,6 +2,9 @@
 import contextlib
 import io
 import unittest
+import csv
+import tempfile
+from pathlib import Path
 from unittest.mock import patch
 from copy import deepcopy
 
@@ -71,7 +74,7 @@ class Regression(unittest.TestCase):
             parser.form_parser()
 
     def test_cli_applies_configuration(self):
-        with patch.object(webcrack, 'CrackTask') as task, contextlib.redirect_stdout(io.StringIO()):
+        with patch.object(webcrack, 'CrackTask') as task, patch.object(webcrack, 'write_results'), contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(webcrack.main(['-u', 'https://example.test/', '--timeout', '5',
                                           '--delay', '0.2', '--proxy', 'http://localhost:8080',
                                           '--no-random-headers']), 0)
@@ -79,6 +82,43 @@ class Regression(unittest.TestCase):
         self.assertEqual(config.crackConfig['timeout'], 5)
         self.assertEqual(config.crackConfig['delay'], .2)
         self.assertFalse(config.generatorConfig['headers_config']['enable'])
+
+    def test_default_output_and_empty_results(self):
+        with tempfile.TemporaryDirectory() as directory:
+            default = Path(directory) / 'output.txt'
+            with patch.dict(config.logConfig, {'output_filename': str(default)}), \
+                    patch.object(webcrack, 'CrackTask') as task, \
+                    contextlib.redirect_stdout(io.StringIO()):
+                task.return_value.run.return_value = None
+                self.assertEqual(webcrack.main(['-u', 'https://example.test/']), 0)
+            self.assertEqual(default.read_text(), 'url\tusername\tpassword\n')
+
+    def test_batch_output_only_successes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / 'urls.txt'
+            source.write_text('https://example.test/a\nhttps://example.test/b\n')
+            output = Path(directory) / 'nested' / 'success.txt'
+            success = {'url': 'https://example.test/b', 'username': '测试', 'password': 'p\tq'}
+            with patch.object(webcrack, 'CrackTask') as task, contextlib.redirect_stdout(io.StringIO()):
+                task.return_value.run.side_effect = [None, success]
+                self.assertEqual(webcrack.main(['-f', str(source), '-o', str(output)]), 0)
+            with output.open(newline='') as handle:
+                self.assertEqual(list(csv.DictReader(handle, delimiter='\t')), [success])
+            webcrack.write_results(output, [])
+            self.assertEqual(output.read_text(), 'url\tusername\tpassword\n')
+
+    def test_recheck_controls_result(self):
+        from crack.crack_task import CrackTask
+        for verified in (True, False):
+            with patch('crack.crack_task.Parser') as parser, \
+                    patch.object(CrackTask, 'get_error_length', return_value=10), \
+                    patch.object(CrackTask, 'crack_task', return_value=('user', 'pass') if verified else (False, False)), \
+                    patch.object(CrackTask, 'recheck', return_value=verified), \
+                    patch('crack.crack_task.Log'), contextlib.redirect_stdout(io.StringIO()):
+                parser.return_value.run.return_value = True
+                result = CrackTask().run(1, 'https://example.test/')
+                expected = {'url': 'https://example.test/', 'username': 'user', 'password': 'pass'}
+                self.assertEqual(result, expected if verified else None)
 
     def test_invalid_cli(self):
         for args in (['-u', 'a', '-f', 'b'], ['--timeout', '0'], ['--delay', '-1'],

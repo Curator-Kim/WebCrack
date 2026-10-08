@@ -108,3 +108,35 @@ File or Url:
 ## 警告！
 
 **请勿用于非法用途！否则自行承担一切后果**
+
+## 成功结果导出
+
+运行结束后，将通过复核的成功结果写入 UTF-8 制表符分隔文件，包含
+`url`、`username`、`password` 三列。默认文件为当前目录的 `output.txt`，
+可通过 `-o/--output` 指定路径，也可修改 `conf/config.py` 的
+`logConfig["output_filename"]`。每次运行覆盖输出文件；没有成功结果时仅写表头。
+原有日期日志保持不变。结果包含明文凭据，请妥善保管。
+
+```bash
+python3 webcrack.py -f url.txt -o results/output.txt
+```
+
+## 登录结果判定
+
+初判和复核使用同一规则：失败提示、仍存在的密码表单、HTTP 异常、
+限流或锁定响应均不记为成功。响应长度、跳转或 Cookie 变化不单独作为成功依据。
+使用 CMS 的成功正文标记，或在 `crackConfig["success_words"]` 配置目标的明确成功标记；
+JSON 接口可配置 `json_success_fields`（顶层字段，全部严格匹配）。
+失败基线也含有的成功标记会被排除；没有明确证据则标记为不确定，不导出。
+复核通过独立会话重新获取登录页面及表单状态。无通用规则能证明任意网站已登录，
+请按页面实际响应配置明确标记。
+
+## JSON 登录接口识别
+
+支持静态 JavaScript 中的 `fetch('登录路径', {method: 'POST', ...
+body: JSON.stringify({username, password})})`，也支持上述字段的显式映射。
+读取内联脚本及同源、路径含 auth/login 的外部脚本；不执行 JavaScript，
+不跟随脚本重定向；多候选不自动选择。动态计算 URL、axios、嵌套字段等尚未支持。
+JSON 请求使用 `application/json`；成功依据配置的 JSON 字段规则，或顶层非空
+字符串 `token/access_token`（仅对 JSON 登录模式启用）。401 视为凭据失败，
+429 仍停止任务。返回 Token 只证明登录接口接受请求，不自动证明权限有效。

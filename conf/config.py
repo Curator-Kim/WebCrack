@@ -12,10 +12,15 @@ def txt2list(txt):
 
 logConfig = {
     "log_filename": "logs.txt",  # 普通日志文件名称
+    "output_filename": "output.txt",  # 本次运行成功结果汇总（覆盖写入）
     "success_filename": "success.txt",  # 成功日志文件名称
 }
 
 crackConfig = {
+    "success_words": [],  # 明确的登录成功正文标记；空列表仅使用 CMS 标记
+    "json_token_fields": ["token", "access_token"],  # 顶层非空字符串 Token
+    "json_success_fields": {},  # JSON 成功规则，例如 {"authenticated": True}，全部匹配
+    "stop_words": ["已被锁定", "密码错误次数过多", "尝试次数", "安全拦截"],
     "timeout": 10,  # 超时时间
     "delay": 0.03,  # 每次请求之后sleep的间隔
     "test_username": "admin",  # 测试用户名
@@ -72,6 +77,9 @@ generatorConfig = {
     }
 }
 parserConfig = {
+    "json_login_detection": True,
+    "json_script_limit": 4,
+    "json_script_max_bytes": 262144,
     "default_value": "0000",  # 当参数没有value时的默认填充值
     "username_keyword_list": [  # 用户名参数关键字列表
         "user",
@@ -171,6 +179,7 @@ cliConfig = {
     "arguments": [
         {"flags": ["-u", "--url"], "group": "target", "help": "单个页面 URL"},
         {"flags": ["-f", "--file"], "group": "target", "help": "URL 列表文件"},
+        {"flags": ["-o", "--output"], "help": "成功结果文件（默认 output.txt，覆盖写入）"},
         {"flags": ["--timeout"], "type": float, "help": "请求超时秒数（大于 0）"},
         {"flags": ["--delay"], "type": float, "help": "请求间隔秒数（不小于 0）"},
         {"flags": ["--proxy"], "help": "HTTP/HTTPS 代理 URL"},

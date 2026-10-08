@@ -1,4 +1,6 @@
 import argparse
+import csv
+from pathlib import Path
 import datetime
 import conf.config
 
@@ -23,9 +25,13 @@ def single_process_crack(url_list):
     all_num = len(url_list)
     cur_num = 1
     print("总任务数: " + str(all_num))
+    results = []
     for url in url_list:
-        CrackTask().run(cur_num, url)
+        result = CrackTask().run(cur_num, url)
+        if isinstance(result, dict):
+            results.append(result)
         cur_num += 1
+    return results
 
 
 def build_argument_parser():
@@ -66,19 +72,44 @@ def main(argv=None):
     if target is None:
         target = input('File or Url:\n').strip()
     if args.url or (not args.file and '://' in target):
-        CrackTask().run(1, target)
-        return 0
+        urls = [target]
+    else:
+        try:
+            with open(target, encoding="utf-8") as handle:
+                urls = [line.strip() for line in handle]
+        except OSError as exc:
+            parser.error(str(exc))
+        urls = [url for url in urls if url and not url.startswith('#') and
+                not any(domain in url for domain in conf.config.IGNORE_DOMAINS)]
+
+    output = Path(args.output or conf.config.logConfig["output_filename"])
+    # 在任务开始前检查路径；不提前清空已有文件。
+    if output.exists() and not output.is_file():
+        parser.error(f"输出路径不是文件: {output}")
     try:
-        with open(target, encoding="utf-8") as handle:
-            urls = [line.strip() for line in handle]
+        output.parent.mkdir(parents=True, exist_ok=True)
+        if output.resolve() == Path(args.file or target).resolve() and not '://' in target:
+            parser.error("输出文件与输入列表文件必须不同")
     except OSError as exc:
-        parser.error(str(exc))
-    urls = [url for url in urls if url and not url.startswith('#') and
-            not any(domain in url for domain in conf.config.IGNORE_DOMAINS)]
+        parser.error(f"准备输出目录失败: {exc}")
     start = datetime.datetime.now()
-    single_process_crack(urls)
+    results = single_process_crack(urls)
+    try:
+        write_results(output, results)
+    except OSError as exc:
+        parser.error(f"写入成功结果失败: {exc}")
     print(f'All processes done! Cost time: {datetime.datetime.now() - start}')
+    print(f'成功结果: {len(results)} 条，已保存至 {output.resolve()}')
     return 0
+
+
+def write_results(path, results):
+    """UTF-8 TSV：表头加每行一条通过复核的结果。"""
+    with Path(path).open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["url", "username", "password"], delimiter="\t")
+        writer.writeheader()
+        writer.writerows(results)
+
 
 
 if __name__ == '__main__':
