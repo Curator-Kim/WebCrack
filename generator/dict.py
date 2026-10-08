@@ -6,8 +6,9 @@ def gen_dict(url):
     username_list, password_list = gen_base_dict()
     if generatorConfig["dict_config"]["domain_dict"]["enable"]:
         domain_user_dict, domain_pass_dict = gen_domain_dict(url)
-        if domain_user_dict and domain_pass_dict:
+        if domain_user_dict:
             username_list.extend(domain_user_dict)
+        if domain_pass_dict:
             password_list.extend(domain_pass_dict)
     if username_list and password_list:
         return username_list, password_list
