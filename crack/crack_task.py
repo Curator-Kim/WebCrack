@@ -117,6 +117,15 @@ class CrackTask:
                     for key, value in rules.items()
                 ):
                     evidence.add(("json", "configured_fields"))
+                inferred = getattr(self.parser, "json_response_success", {})
+                required = getattr(self.parser, "json_required_nonempty_fields", [])
+                if isinstance(body, dict) and inferred and all(
+                    isinstance(body.get(key), str) and bool(body[key].strip()) for key in required
+                ) and all(
+                    any(type(body.get(key)) is type(value) and body.get(key) == value for value in values)
+                    for key, values in inferred.items()
+                ):
+                    evidence.add(("json", "script_success_rule"))
                 if isinstance(body, dict) and getattr(self.parser, "request_format", "form") == "json":
                     for field in crackConfig.get("json_token_fields", []):
                         token = body.get(field)

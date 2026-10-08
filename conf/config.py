@@ -79,7 +79,7 @@ generatorConfig = {
 parserConfig = {
     "json_login_detection": True,
     "json_script_limit": 4,
-    "json_script_max_bytes": 262144,
+    "json_script_max_bytes": 2097152,  # 单个脚本最多 2 MiB，仍受脚本数量上限约束
     "default_value": "0000",  # 当参数没有value时的默认填充值
     "username_keyword_list": [  # 用户名参数关键字列表
         "user",

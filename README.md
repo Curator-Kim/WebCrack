@@ -140,3 +140,14 @@ body: JSON.stringify({username, password})})`，也支持上述字段的显式�
 JSON 请求使用 `application/json`；成功依据配置的 JSON 字段规则，或顶层非空
 字符串 `token/access_token`（仅对 JSON 登录模式启用）。401 视为凭据失败，
 429 仍停止任务。返回 Token 只证明登录接口接受请求，不自动证明权限有效。
+
+支持当前表单的 `$.post(字面量路径或字面量常量 + 路径,
+$("#表单ID").serialize(), 回调)`。请求保持表单编码，脚本引用的接口地址
+必须同源且唯一；只在该回调明确使用 `data.code == "200"` 时采纳 JSON 成功码。
+不将所有站点的 `code=200` 全局视为登录成功。动态 URL、其他包装器不自动推断。
+
+也会读取同源 `type="module"` 入口（单文件最多 2 MiB，默认最多 4 个）。
+支持静态 Axios `create({baseURL: 字面量})`、登录方法 `.post(字面量路径, 参数)`，
+以及 `{username: "", password: ""}` 模型到登录方法再到 Token 存储的明确调用链。
+若响应拦截器明确用 `code === 200` 返回 `data`，则成功需同时满足数值成功码
+和 `data` 非空字符串。仍不执行 JavaScript，不递归解析任意模块或猜测动态参数。
