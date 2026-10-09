@@ -10,17 +10,12 @@ from crack.crack_task import CrackTask
 
 author_info = r'''
 +---------------------------------------------------+
-| __          __  _      _____                _     |
-| \ \        / / | |    / ____|              | |    |
-|  \ \  /\  / /__| |__ | |     _ __ __ _  ___| | __ |
-|   \ \/  \/ / _ \ '_ \| |    | '__/ _' |/ __| |/ / |
-|    \  /\  /  __/ |_) | |____| | | (_| | (__|   <  |
-|     \/  \/ \___|_.__/ \_____|_|  \__,_|\___|_|\_\ |
-|                                                   |
-|                 code by @yzddmr6                  |
-|                  version: 2.2                     |
+|                   WebCrack-plus                   |
+|        Concurrent Web Login Checking Tool         |
+|      Based on WebCrack v2.2 by @yzddmr6            |
 +---------------------------------------------------+
 '''
+
 
 
 def multi_thread_crack(url_list, threads=5):
@@ -45,7 +40,7 @@ def multi_thread_crack(url_list, threads=5):
             Log.init_log_id(None)
 
     with ThreadPoolExecutor(max_workers=min(threads, len(url_list)),
-                            thread_name_prefix="webcrack") as executor:
+                            thread_name_prefix="webcrack-plus") as executor:
         pending = {}
 
         def submit_next():

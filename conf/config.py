@@ -70,7 +70,7 @@ generatorConfig = {
         "enable": True,
         "default_headers": {
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            'User-Agent': "WebCrack Test",
+            'User-Agent': "WebCrack-plus",
             'Accept-Encoding': 'gzip, deflate',
             'Accept-Language': 'zh-CN,zh;q=0.8',
             "Referer": "http://www.baidu.com/",
@@ -183,7 +183,7 @@ cmsConfig = {
 
 # 命令行选项定义；默认参数留在已有配置中，命令行仅覆盖本次运行。
 cliConfig = {
-    "description": "WebCrack 表单检测工具",
+    "description": "WebCrack-plus 表单与静态登录接口检测工具",
     "arguments": [
         {"flags": ["-u", "--url"], "group": "target", "help": "单个页面 URL"},
         {"flags": ["-f", "--file"], "group": "target", "help": "URL 列表文件"},
