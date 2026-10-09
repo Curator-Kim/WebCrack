@@ -21,6 +21,7 @@ crackConfig = {
     "json_token_fields": ["token", "access_token"],  # 顶层非空字符串 Token
     "json_success_fields": {},  # JSON 成功规则，例如 {"authenticated": True}，全部匹配
     "stop_words": ["已被锁定", "密码错误次数过多", "尝试次数", "安全拦截"],
+    "concurrency": 5,  # 每个 URL 同时执行的候选登录请求数
     "timeout": 10,  # 超时时间
     "delay": 0.03,  # 每次请求之后sleep的间隔
     "test_username": "admin",  # 测试用户名
@@ -187,6 +188,8 @@ cliConfig = {
         {"flags": ["-u", "--url"], "group": "target", "help": "单个页面 URL"},
         {"flags": ["-f", "--file"], "group": "target", "help": "URL 列表文件"},
         {"flags": ["-o", "--output"], "help": "成功结果文件（默认 output.txt，覆盖写入）"},
+        {"flags": ["-t", "--threads"], "type": int, "default": 5, "help": "并发 URL 任务数（默认 5，正整数；1 为顺序执行）"},
+        {"flags": ["-c", "--concurrency"], "type": int, "help": "每个 URL 的登录请求并发数（默认配置为 5，1 为串行）"},
         {"flags": ["--timeout"], "type": float, "help": "请求超时秒数（大于 0）"},
         {"flags": ["--delay"], "type": float, "help": "请求间隔秒数（不小于 0）"},
         {"flags": ["--proxy"], "help": "HTTP/HTTPS 代理 URL"},

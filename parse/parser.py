@@ -1,5 +1,6 @@
 from urllib.parse import urljoin, urlsplit
 import re
+from copy import deepcopy
 from parse.recognizers import discover_candidates, same_origin, calls, environment, object_fields, string_value
 from parse.resources import load_scripts
 from conf.config import *
@@ -75,6 +76,70 @@ class Parser:
             Log.Error(f"[-] {self.url} Parse Error [{self.diagnostic_code}]: " + str(e))
             return False
         return True
+
+    @staticmethod
+    def _script_signature(content):
+        soup = BS(content, "lxml")
+        return tuple((tag.get("src", ""), tag.get("type", ""),
+                      "" if tag.get("src") else tag.get_text())
+                     for tag in soup.find_all("script")) + tuple(
+                         (tag.get("href", ""), tuple(tag.get("rel", [])), tag.get("as", ""))
+                         for tag in soup.find_all("link", href=True)
+                         if any(rel in ("modulepreload", "preload") for rel in tag.get("rel", [])))
+
+    @staticmethod
+    def _form_signature(form):
+        if not form or not hasattr(form, "find_all"):
+            return None
+        return (form.get("id", ""), form.get("action", ""), form.get("method", "").lower(),
+                tuple((field.get("name", ""), field.get("type", "text").lower(),
+                       field.has_attr("disabled")) for field in form.find_all("input")))
+
+    def refresh_from(self, template):
+        """刷新页面状态；结构未变时复用任务内接口映射，不重复扫描脚本。"""
+        for field in ("post_path", "request_format", "username_keyword", "password_keyword",
+                      "data", "request_headers", "cms", "json_token_fields",
+                      "profile_success_fields", "json_response_success",
+                      "json_required_nonempty_fields"):
+            setattr(self, field, deepcopy(getattr(template, field)))
+        self.script_cache = dict(template.script_cache)
+        self.login_scripts = list(template.login_scripts)
+        if template.diagnostic_code == "PROFILE_APPLIED":
+            self.diagnostic_code = "PROFILE_APPLIED"
+            return True
+        try:
+            # 已发现的登录入口直接刷新，不重新访问首页及发现入口。
+            original_url = self.url
+            self.url = getattr(template, "response_url", template.url)
+            try:
+                self.get_resp_content()
+            finally:
+                self.url = original_url
+            changed = self.response_url != getattr(template, "response_url", template.url)
+            changed |= self._script_signature(self.resp_content) != self._script_signature(template.resp_content)
+            changed |= tuple(keyword["keywords"] in self.resp_content for keyword in cmsConfig.values()) != tuple(
+                keyword["keywords"] in template.resp_content for keyword in cmsConfig.values())
+            if not changed and self.request_format == "form":
+                self.form_parser()
+                changed = self._form_signature(self.form_content) != self._form_signature(template.form_content)
+                if not changed:
+                    self.check_login_page()
+                    self.captcha_parser()
+                    self.param_parser()  # Cookie、隐藏字段及勾选状态来自新页面。
+            if changed:
+                self.script_cache.clear()
+                Log.Info(f"[*] 登录页面结构变化，重新识别接口: {self.response_url}")
+                fresh = Parser(self.url, session=self.session)
+                result = fresh.run()
+                self.__dict__.clear()
+                self.__dict__.update(fresh.__dict__)
+                return result
+            self.diagnostic_code = "PLAN_REFRESHED"
+            return True
+        except Exception as exc:
+            self.diagnostic_code = getattr(exc, "code", "PAGE_HTTP_ERROR" if isinstance(exc, requests.RequestException) else "PARSE_ERROR")
+            Log.Error(f"[-] {self.url} Refresh Error [{self.diagnostic_code}]: {exc}")
+            return False
 
     def apply_site_profile(self):
         matches = [profile for profile in parserConfig.get("site_profiles", [])

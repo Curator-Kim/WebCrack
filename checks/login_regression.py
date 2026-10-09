@@ -24,7 +24,7 @@ def response(body, status=200, content_type='text/html'):
 class LoginTests(unittest.TestCase):
     def setUp(self):
         self.settings = patch.dict(crackConfig, {'success_words': ['AUTHENTICATED'],
-                                               'json_success_fields': {}})
+                                               'json_success_fields': {}, 'concurrency': 1})
         self.settings.start()
         self.task = CrackTask()
         self.task.parser = SimpleNamespace(cms={}, username_keyword='username', password_keyword='password',

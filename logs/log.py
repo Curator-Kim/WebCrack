@@ -1,25 +1,24 @@
 import time, os
+import threading
 from conf.config import *
 
 date = time.strftime('%Y-%m-%d', time.localtime(time.time()))
 log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), date)
-if not os.path.exists(log_dir):
-    os.mkdir(log_dir)
+os.makedirs(log_dir, exist_ok=True)
 
 success_filename = os.path.join(log_dir, logConfig["success_filename"])
 log_filename = os.path.join(log_dir, logConfig["log_filename"])
-lock = {}
-id = ''
+lock = threading.RLock()
+_context = threading.local()
 
 
 def init_lock(l):
     global lock
-    lock = l
+    lock = l if l is not None else threading.RLock()
 
 
 def init_log_id(i):
-    global id
-    id = i
+    _context.task_id = i
 
 
 def get_time():
@@ -27,19 +26,16 @@ def get_time():
 
 
 def write_log(filename, msg):
-    if lock:
-        with lock:
-            with open(filename, "a+", encoding="UTF-8") as log:
-                log.write(msg + "\n")
-    else:
+    with lock:
         with open(filename, "a+", encoding="UTF-8") as log:
             log.write(msg + "\n")
 
 
 def Info(msg):
     current_time = get_time()
-    if id:
-        msg = f"{current_time}  id: {id} {str(msg)}"
+    task_id = getattr(_context, "task_id", None)
+    if task_id:
+        msg = f"{current_time}  id: {task_id} {str(msg)}"
     else:
         msg = f"{current_time}  {str(msg)}"
     print(msg)
@@ -47,8 +43,9 @@ def Info(msg):
 
 def Error(msg):
     current_time = get_time()
-    if id:
-        msg = f"{current_time}  id: {id} {str(msg)}"
+    task_id = getattr(_context, "task_id", None)
+    if task_id:
+        msg = f"{current_time}  id: {task_id} {str(msg)}"
     else:
         msg = f"{current_time}  {str(msg)}"
     print(msg)
@@ -57,8 +54,9 @@ def Error(msg):
 
 def Success(msg):
     current_time = get_time()
-    if id:
-        msg = f"{current_time}  id: {id} {str(msg)}"
+    task_id = getattr(_context, "task_id", None)
+    if task_id:
+        msg = f"{current_time}  id: {task_id} {str(msg)}"
     else:
         msg = f"{current_time}  {str(msg)}"
     print(msg)

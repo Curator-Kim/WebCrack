@@ -1,4 +1,8 @@
 import requests
+import threading
+from copy import copy, deepcopy
+from contextlib import contextmanager
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from enum import Enum
 from parse.recognizers import json_path
 
@@ -15,7 +19,7 @@ from generator.dict import *
 from generator.header import get_random_headers
 from conf.config import *
 import logs.log as Log
-from parse.parser import Parser
+from parse.parser import Parser, Parser as _ParserType
 from requests.packages.urllib3.exceptions import InsecureRequestWarning
 
 requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
@@ -49,6 +53,11 @@ class CrackTask:
         self.baseline_responses = []
         self.stopped = False
         self.conn = None
+        self._json_sessions = None
+        self._json_sessions_lock = threading.Lock()
+        self.concurrency = crackConfig.get("concurrency", 5)
+        if isinstance(self.concurrency, bool) or not isinstance(self.concurrency, int) or self.concurrency <= 0:
+            raise ValueError("concurrency 必须是正整数")
 
     def run(self, id, url):
         self.id = id
@@ -196,7 +205,8 @@ class CrackTask:
         try:
             with requests.session() as conn:
                 parser = Parser(self.url, session=conn)
-                if not parser.run():
+                refreshed = parser.refresh_from(previous) if isinstance(previous, _ParserType) else parser.run()
+                if not refreshed:
                     return None
                 self.parser = parser
                 return self.crack_request(conn, username, password)
@@ -221,6 +231,172 @@ class CrackTask:
         return state == LoginState.SUCCESS
 
     def crack_task(self, username_dict, password_dict):
+        if self.stopped:
+            return False, False
+        if self.concurrency == 1:
+            return self._serial_crack_task(username_dict, password_dict)
+        return self._concurrent_crack_task(username_dict, password_dict)
+
+    def _copy_request_plan(self, conn):
+        # 复用只读识别结果，独立复制请求数据和成功规则，避免复核/填参串线。
+        parser = copy(self.parser)
+        parser.session = conn
+        for field in ("data", "request_headers", "cms", "json_token_fields",
+                      "profile_success_fields", "json_response_success",
+                      "json_required_nonempty_fields"):
+            if hasattr(parser, field):
+                setattr(parser, field, deepcopy(getattr(parser, field)))
+        return parser
+
+    @contextmanager
+    def _request_context(self):
+        if getattr(self.parser, "request_format", "form") != "json":
+            # 表单可能包含一次性 CSRF 字段，仍逐次刷新；静态脚本使用任务缓存。
+            with requests.session() as conn:
+                parser = Parser(self.url, session=conn)
+                refreshed = parser.refresh_from(self.parser) if isinstance(self.parser, _ParserType) else parser.run()
+                if not refreshed:
+                    raise ValueError("登录表单刷新失败")
+                yield conn, parser
+            return
+
+        # JSON 接口映射是已识别的静态结构，不逐候选下载/识别 JS。
+        thread_id = threading.get_ident()
+        owned = self._json_sessions is None
+        conn = None
+        cached = None
+        if not owned:
+            with self._json_sessions_lock:
+                cached = self._json_sessions.get(thread_id)
+                if cached is not None:
+                    conn, bootstrap = cached
+        if conn is None:
+            conn = requests.session()
+            try:
+                bootstrap = self._copy_request_plan(conn)
+                if getattr(bootstrap, "diagnostic_code", "") != "PROFILE_APPLIED":
+                    # 每个工作线程只初始化一次页面 Cookie，不再解析页面/脚本。
+                    if not bootstrap.refresh_from(self.parser):
+                        raise ValueError("登录页面状态刷新失败")
+            except BaseException:
+                conn.close()
+                raise
+            if not owned:
+                with self._json_sessions_lock:
+                    self._json_sessions[thread_id] = (conn, bootstrap)
+        if cached is not None and bootstrap.request_format != "json":
+            refreshed = Parser(self.url, session=conn)
+            if not refreshed.refresh_from(bootstrap):
+                raise ValueError("已变化的登录表单刷新失败")
+            bootstrap = refreshed
+            with self._json_sessions_lock:
+                self._json_sessions[thread_id] = (conn, bootstrap)
+        try:
+            # 不修改协调线程的 parser；每次独立复制线程内已刷新的规则。
+            parser = copy(bootstrap)
+            for field in ("data", "request_headers", "cms", "json_token_fields",
+                          "profile_success_fields", "json_response_success", "json_required_nonempty_fields"):
+                setattr(parser, field, deepcopy(getattr(bootstrap, field)))
+            yield conn, parser
+        finally:
+            if owned:
+                conn.close()
+
+    def _attempt(self, username, password, stop):
+        """JSON 复用线程内连接与静态请求计划；动态表单逐次刷新。"""
+        Log.init_log_id(self.id)
+        worker = CrackTask()
+        worker.id, worker.url = self.id, self.url
+        worker.baseline_responses = list(self.baseline_responses)
+        try:
+            if stop.is_set():
+                return None
+            with self._request_context() as (conn, parser):
+                worker.conn = conn
+                worker.parser = parser
+                if stop.is_set():
+                    return None
+                res = worker.crack_request(conn, username, password)
+                state = worker.classify_response(res)
+                if state in (LoginState.STOPPED, LoginState.ERROR):
+                    stop.set()
+                    Log.Info(f"[*] 停止当前任务: {state.value} HTTP {res.status_code}")
+                return state, username, password, worker
+        except Exception as exc:
+            stop.set()
+            Log.Error(f"[-] 登录请求异常: {self.url}: {exc}")
+            return LoginState.ERROR, username, password, worker
+        finally:
+            worker.conn = None
+            Log.init_log_id(None)
+
+    def _concurrent_crack_task(self, username_dict, password_dict):
+        total = len(username_dict) * len(password_dict)
+        if not total:
+            return False, False
+        candidates = iter((username, password.replace('{user}', username))
+                          for username in username_dict for password in password_dict)
+        stop = threading.Event()
+        pending = set()
+        submitted = 0
+        self._json_sessions = {}
+        executor = ThreadPoolExecutor(max_workers=min(self.concurrency, total),
+                                      thread_name_prefix="login-request")
+
+        def submit_next():
+            nonlocal submitted
+            if stop.is_set():
+                return
+            candidate = next(candidates, None)
+            if candidate is not None:
+                username, password = candidate
+                submitted += 1
+                Log.Info(f"[*] {self.url} 进度: ({submitted}/{total}) checking: {username} {password}")
+                pending.add(executor.submit(self._attempt, username, password, stop))
+
+        try:
+            for _ in range(min(self.concurrency, total)):
+                submit_next()
+            while pending:
+                done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                pending.difference_update(done)
+                outcomes = [future.result() for future in done]
+                # 同一完成批次中限流/异常优先，避免忽略已观测的停止响应。
+                if any(outcome and outcome[0] in (LoginState.STOPPED, LoginState.ERROR)
+                       for outcome in outcomes):
+                    self.stopped = True
+                    return False, False
+                for outcome in outcomes:
+                    if outcome is None:
+                        continue
+                    state, username, password, worker = outcome
+                    if state == LoginState.SUCCESS:
+                        if stop.is_set():
+                            self.stopped = True
+                            return False, False
+                        # 复核只在协调线程执行；worker 的 parser 与其他尝试隔离。
+                        verified = worker.recheck(username, password)
+                        if worker.stopped or stop.is_set():
+                            self.stopped = True
+                            return False, False
+                        if verified:
+                            return username, password
+                    elif state == LoginState.UNKNOWN:
+                        Log.Info("[*] 登录状态不确定：缺少明确成功证据")
+                for _ in done:
+                    submit_next()
+            return False, False
+        finally:
+            stop.set()
+            for future in pending:
+                future.cancel()
+            # 已发送请求仍需收尾；等待其关闭会话，停止提交新请求。
+            executor.shutdown(wait=True, cancel_futures=True)
+            for conn, parser in self._json_sessions.values():
+                conn.close()
+            self._json_sessions = None
+
+    def _serial_crack_task(self, username_dict, password_dict):
         num = 0
         dic_all = len(username_dict) * len(password_dict)
         for username in username_dict:

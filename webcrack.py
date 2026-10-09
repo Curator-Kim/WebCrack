@@ -1,5 +1,7 @@
 import argparse
 import csv
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+import logs.log as Log
 from pathlib import Path
 import datetime
 import conf.config
@@ -21,17 +23,53 @@ author_info = r'''
 '''
 
 
+def multi_thread_crack(url_list, threads=5):
+    """并发执行独立 URL 任务；限制待处理 Future 数并保持结果顺序。"""
+    if isinstance(threads, bool) or not isinstance(threads, int) or threads <= 0:
+        raise ValueError("threads 必须是正整数")
+    print("总任务数: " + str(len(url_list)))
+    if not url_list:
+        return []
+    results = {}
+    tasks = iter(enumerate(url_list, 1))
+
+    def run_task(task_id, url):
+        # 每个 URL 都创建独立任务及 requests.Session。
+        Log.init_log_id(task_id)
+        try:
+            return CrackTask().run(task_id, url)
+        except Exception as exc:
+            Log.Error(f"[-] 任务异常: {url}: {exc}")
+            return None
+        finally:
+            Log.init_log_id(None)
+
+    with ThreadPoolExecutor(max_workers=min(threads, len(url_list)),
+                            thread_name_prefix="webcrack") as executor:
+        pending = {}
+
+        def submit_next():
+            task = next(tasks, None)
+            if task is not None:
+                task_id, url = task
+                pending[executor.submit(run_task, task_id, url)] = task_id
+
+        for _ in range(min(threads, len(url_list))):
+            submit_next()
+        while pending:
+            done, _ = wait(pending, return_when=FIRST_COMPLETED)
+            for future in done:
+                task_id = pending.pop(future)
+                result = future.result()
+                if isinstance(result, dict):
+                    results[task_id] = result
+                submit_next()
+    return [results[task_id] for task_id in sorted(results)]
+
+
 def single_process_crack(url_list):
-    all_num = len(url_list)
-    cur_num = 1
-    print("总任务数: " + str(all_num))
-    results = []
-    for url in url_list:
-        result = CrackTask().run(cur_num, url)
-        if isinstance(result, dict):
-            results.append(result)
-        cur_num += 1
-    return results
+    """保留旧入口；使用一个工作线程顺序执行。"""
+    return multi_thread_crack(url_list, threads=1)
 
 
 def build_argument_parser():
@@ -48,6 +86,12 @@ def build_argument_parser():
 def main(argv=None):
     parser = build_argument_parser()
     args = parser.parse_args(argv)
+    if args.threads <= 0:
+        parser.error("--threads 必须是正整数")
+    if args.concurrency is not None:
+        if args.concurrency <= 0:
+            parser.error("--concurrency 必须是正整数")
+        conf.config.crackConfig["concurrency"] = args.concurrency
     if args.timeout is not None:
         import math
         if not math.isfinite(args.timeout) or args.timeout <= 0:
@@ -82,6 +126,11 @@ def main(argv=None):
         urls = [url for url in urls if url and not url.startswith('#') and
                 not any(domain in url for domain in conf.config.IGNORE_DOMAINS)]
 
+    unique_urls = list(dict.fromkeys(urls))
+    if len(unique_urls) != len(urls):
+        print(f"已合并重复 URL: {len(urls) - len(unique_urls)} 条")
+    urls = unique_urls
+
     output = Path(args.output or conf.config.logConfig["output_filename"])
     # 在任务开始前检查路径；不提前清空已有文件。
     if output.exists() and not output.is_file():
@@ -93,7 +142,7 @@ def main(argv=None):
     except OSError as exc:
         parser.error(f"准备输出目录失败: {exc}")
     start = datetime.datetime.now()
-    results = single_process_crack(urls)
+    results = multi_thread_crack(urls, threads=args.threads)
     try:
         write_results(output, results)
     except OSError as exc:
