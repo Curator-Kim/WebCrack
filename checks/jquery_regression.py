@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 import requests
 from conf.config import crackConfig, generatorConfig
-from parse.parser import Parser
+from parse.parser import Parser, ParseIssue
 from crack.crack_task import CrackTask, LoginState
 from checks.login_regression import response
 
@@ -47,7 +47,9 @@ class JQueryTests(unittest.TestCase):
         parser = self.parser(SCRIPT.replace('base_url + "/login"', '"http://other.test/login"'))
         self.assertFalse(parser.jquery_login_parser())
         parser = self.parser(SCRIPT + SCRIPT.replace('"/login"', '"/login2"'))
-        self.assertFalse(parser.jquery_login_parser())
+        with self.assertRaises(ParseIssue) as raised:
+            parser.jquery_login_parser()
+        self.assertEqual(raised.exception.code, "AMBIGUOUS_INTERFACE")
 
     def test_success_scope_and_strict_types(self):
         task = CrackTask()

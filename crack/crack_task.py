@@ -1,5 +1,6 @@
 import requests
 from enum import Enum
+from parse.recognizers import json_path
 
 
 class LoginState(Enum):
@@ -90,6 +91,7 @@ class CrackTask:
         data[self.parser.username_keyword] = username
         data[self.parser.password_keyword] = password
         headers = get_random_headers()
+        headers.update(getattr(self.parser,"request_headers",{}))
         payload = {"data": data}
         if getattr(self.parser, "request_format", "form") == "json":
             headers["Content-Type"] = "application/json"
@@ -102,34 +104,43 @@ class CrackTask:
 
     def _success_evidence(self, res):
         evidence = set()
-        words = list(crackConfig.get("success_words", []))
+        using_profile = getattr(self.parser,"profile_success_fields",None) is not None
+        words = [] if using_profile else list(crackConfig.get("success_words", []))
         if self.parser.cms and self.parser.cms.get("success_flag"):
             words.append(self.parser.cms["success_flag"])
         for word in words:
             if word and word in res.text:
                 evidence.add(("body", word))
-        rules = crackConfig.get("json_success_fields", {})
+        profile_rules = getattr(self.parser,"profile_success_fields",None)
+        rules = crackConfig.get("json_success_fields", {}) if profile_rules is None else profile_rules
         if "json" in res.headers.get("Content-Type", "").lower():
             try:
                 body = res.json()
                 if isinstance(body, dict) and rules and all(
-                    key in body and type(body[key]) is type(value) and body[key] == value
+                    type(json_path(body,key)) is type(value) and json_path(body,key) == value
                     for key, value in rules.items()
                 ):
-                    evidence.add(("json", "configured_fields"))
+                    required = getattr(self.parser,"json_required_nonempty_fields",[])
+                    if all(isinstance(json_path(body,key),str) and json_path(body,key).strip() for key in required):
+                        evidence.add(("json", "configured_fields"))
                 inferred = getattr(self.parser, "json_response_success", {})
                 required = getattr(self.parser, "json_required_nonempty_fields", [])
                 if isinstance(body, dict) and inferred and all(
-                    isinstance(body.get(key), str) and bool(body[key].strip()) for key in required
+                    isinstance(json_path(body,key), str) and bool(json_path(body,key).strip()) for key in required
                 ) and all(
-                    any(type(body.get(key)) is type(value) and body.get(key) == value for value in values)
+                    any(type(json_path(body,key)) is type(value) and json_path(body,key) == value for value in values)
                     for key, values in inferred.items()
                 ):
                     evidence.add(("json", "script_success_rule"))
-                if isinstance(body, dict) and getattr(self.parser, "request_format", "form") == "json":
-                    for field in crackConfig.get("json_token_fields", []):
-                        token = body.get(field)
-                        if isinstance(token, str) and token.strip():
+                if isinstance(body, dict) and (getattr(self.parser, "request_format", "form") == "json"
+                                              or getattr(self.parser,"json_token_fields",None) is not None):
+                    profile_tokens = getattr(self.parser,"json_token_fields",None)
+                    tokens = crackConfig.get("json_token_fields", []) if profile_tokens is None else profile_tokens
+                    for field in tokens:
+                        token = json_path(body,field)
+                        required = getattr(self.parser,"json_required_nonempty_fields",[])
+                        if (isinstance(token, str) and token.strip() and ((profile_rules is None and not inferred) or (profile_rules is not None and not profile_rules))
+                                and all(isinstance(json_path(body,key),str) and json_path(body,key).strip() for key in required)):
                             evidence.add(("token", field))
             except (ValueError, TypeError):
                 pass

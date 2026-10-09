@@ -151,3 +151,59 @@ $("#表单ID").serialize(), 回调)`。请求保持表单编码，脚本引用�
 以及 `{username: "", password: ""}` 模型到登录方法再到 Token 存储的明确调用链。
 若响应拦截器明确用 `code === 200` 返回 `data`，则成功需同时满足数值成功码
 和 `data` 非空字符串。仍不执行 JavaScript，不递归解析任意模块或猜测动态参数。
+
+## 扩展识别与配置式适配
+
+识别流程：精确站点配置 → 页面/脚本静态识别 → 一个明确的同源登录链接 → 传统表单。
+通用静态识别器位于 `parse/recognizers.py`，资源读取位于 `parse/resources.py`；
+之前验证过的 jQuery serialize 和 Axios 包装响应适配仍保留。
+
+支持的静态子集：
+- `fetch(url, options)` + `JSON.stringify(对象或明确变量)`；
+- `axios.post()`、`axios.request()`、`axios({...})` 及有字面量 baseURL 的实例；
+- `$.ajax()` / `jQuery.ajax()` 的对象数据、JSON.stringify 数据及明确表单 serialize；
+- 字符串常量、字面量配置对象属性、常量拼接、仅含已知常量的模板字符串；
+- username/userName/account/mobile/email 等字段和 password/passwd/pwd/pass 等字段；
+- 保留已知标量附加参数；动态 CSRF、加密转换、未解析的附加字段不自动猜测。
+
+只读取同源脚本，不跟随脚本重定向；默认最多 8 个外部资源、单个 2 MiB、
+总读取预算 8 MiB，静态依赖深度 1。支持 modulepreload 与字面量模块依赖，
+同一个解析器内缓存资源；带自定义或动态请求头的通用请求暂交由配置式适配，避免遗漏头部。
+首页只跟随一个明确的同源登录链接，不进行路径枚举。
+资源限制可在 `parserConfig` 中调整。此功能不是 JavaScript 执行器。
+
+若规则无法确定接口，在 `conf/config.py` 的 `parserConfig["site_profiles"]` 中添加：
+
+```python
+{
+    "page_url": "http://127.0.0.1:9000/login",  # 精确匹配，不使用通配域名
+    "endpoint": "/api/session",              # 必须同源
+    "encoding": "json",                     # json 或 form，当前仅 POST
+    "username_field": "account",
+    "password_field": "secret",
+    "extra_data": {"tenant": "demo"},        # 不在这里存储用户名或密码
+    "headers": {},                          # 可选的明确静态请求头
+    "success_fields": {"result.success": True},
+    "required_token_fields": ["result.accessToken"],
+    "token_fields": [],
+}
+```
+
+`success_fields` 使用精确类型比较，并且所有字段同时匹配；缺失字段不等于 null。
+`required_token_fields` 中的路径必须返回非空字符串。若仅需要 Token 判定，
+可省略 success_fields，并设置 `token_fields: ["data.token"]`。
+配置式成功规则不使用全局成功字段和默认 Token 字段作为后备。
+全局 `json_success_fields/json_token_fields` 也支持点分隔的嵌套对象路径。
+找到接口不等于证明身份或权限有效；仅有长度变化、跳转或 Cookie 变化仍不报成功。
+
+典型诊断：`AMBIGUOUS_INTERFACE`（接口/字段映射不唯一）、`AMBIGUOUS_ENTRY`
+（入口不唯一）、`UNRESOLVED_FIELDS`（字段未确定）、`CAPTCHA_REQUIRED`、
+`NO_LOGIN_INTERFACE`（缺少表单或静态接口）、`INVALID_PROFILE`、`PAGE_HTTP_ERROR`。
+候选及来源证据保存在 `Parser.candidates`，资源读取警告保存在 `resource_warnings`。
+
+运行回归测试（只使用离线样例与临时回环 HTTP 服务）：
+
+```bash
+python3 -m unittest discover -s checks -p '*regression.py' -v
+python3 -m checks.local_integration
+```

@@ -2,7 +2,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 from conf.config import parserConfig, crackConfig
-from parse.parser import Parser
+from parse.parser import Parser, ParseIssue
 from crack.crack_task import CrackTask, LoginState
 from checks.login_regression import response
 
@@ -26,7 +26,12 @@ class JsonTests(unittest.TestCase):
             "fetch('https://other.test/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username,password})})",
             "fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username,password})});" +
             "fetch('/api/signin',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username,password})})"):
-            self.assertFalse(self.parser(script).json_login_parser())
+            if "other.test" in script:
+                self.assertFalse(self.parser(script).json_login_parser())
+            else:
+                with self.assertRaises(ParseIssue) as raised:
+                    self.parser(script).json_login_parser()
+                self.assertEqual(raised.exception.code, "AMBIGUOUS_INTERFACE")
 
     def test_json_payload(self):
         task = CrackTask()

@@ -78,7 +78,13 @@ generatorConfig = {
 }
 parserConfig = {
     "json_login_detection": True,
-    "json_script_limit": 4,
+    "json_script_limit": 8,
+    "script_dependency_depth": 1,
+    "script_total_max_bytes": 8388608,
+    "discover_login_links": True,
+    "site_profiles": [],  # 精确 page_url 匹配；配置示例见 README
+    "username_field_names": ["username", "user", "account", "mobile", "email", "loginname"],
+    "password_field_names": ["password", "passwd", "pwd", "pass"],
     "json_script_max_bytes": 2097152,  # 单个脚本最多 2 MiB，仍受脚本数量上限约束
     "default_value": "0000",  # 当参数没有value时的默认填充值
     "username_keyword_list": [  # 用户名参数关键字列表
@@ -88,6 +94,7 @@ parserConfig = {
         "yonghu",
         "email",
         "account",
+        "mobile",
     ],
     "password_keyword_list": [  # 密码参数关键字列表
         "pass",

@@ -1,5 +1,7 @@
 from urllib.parse import urljoin, urlsplit
 import re
+from parse.recognizers import discover_candidates, same_origin, calls, environment, object_fields, string_value
+from parse.resources import load_scripts
 from conf.config import *
 import requests
 from bs4 import BeautifulSoup as BS
@@ -8,6 +10,12 @@ import logs.log as Log
 from requests.packages.urllib3.exceptions import InsecureRequestWarning
 
 requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+
+
+class ParseIssue(ValueError):
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
 
 
 class Parser:
@@ -22,6 +30,16 @@ class Parser:
     cms = ''
 
     def __init__(self, url, session=None):
+        self.script_cache = {}
+        self.resource_warnings = []
+        self.resource_count = 0
+        self.diagnostic_code = "NOT_RUN"
+        self.candidates = []
+        self.json_token_fields = None
+        self.profile_success_fields = None
+        self.request_headers = {}
+        self.timeout = crackConfig["timeout"]
+        self.headers = get_random_headers
         self.login_scripts = []
         self.json_response_success = {}
         self.json_required_nonempty_fields = []
@@ -32,25 +50,113 @@ class Parser:
 
     def run(self):
         try:
+            if self.apply_site_profile():
+                self.diagnostic_code = "PROFILE_APPLIED"
+                return True
             self.get_resp_content()
             self.cms_parser()
             if self.json_login_parser():
+                self.diagnostic_code = "INTERFACE_FOUND"
                 return True
+            if self.discover_login_entry():
+                self.cms_parser()
+                if self.json_login_parser():
+                    self.diagnostic_code = "INTERFACE_FOUND"
+                    return True
             self.form_parser()
             self.check_login_page()
             self.captcha_parser()
             self.post_path_parser()
             self.param_parser()
             self.jquery_login_parser()
+            self.diagnostic_code = "FORM_FOUND"
         except Exception as e:
-            Log.Error(f"[-] {self.url} Parse Error: " + str(e))
+            self.diagnostic_code = getattr(e, "code", "PAGE_HTTP_ERROR" if isinstance(e,requests.RequestException) else "PARSE_ERROR")
+            Log.Error(f"[-] {self.url} Parse Error [{self.diagnostic_code}]: " + str(e))
             return False
+        return True
+
+    def apply_site_profile(self):
+        matches = [profile for profile in parserConfig.get("site_profiles", [])
+                   if profile.get("page_url") == self.url]
+        if not matches:
+            return False
+        if len(matches) != 1:
+            raise ParseIssue("AMBIGUOUS_PROFILE", "存在多个匹配的接口配置")
+        profile = matches[0]
+        endpoint = urljoin(self.url, profile.get("endpoint", ""))
+        if not profile.get("endpoint") or not same_origin(self.url, endpoint):
+            raise ParseIssue("INVALID_PROFILE", "接口配置需要同源的明确 endpoint")
+        if profile.get("encoding", "json") not in ("json", "form"):
+            raise ParseIssue("INVALID_PROFILE", "encoding 仅支持 json 或 form")
+        username, password = profile.get("username_field"), profile.get("password_field")
+        if not isinstance(username,str) or not isinstance(password,str) or not username or not password or username == password:
+            raise ParseIssue("INVALID_PROFILE", "需要不同的用户名和密码字段")
+        data = profile.get("extra_data", {})
+        if not isinstance(data,dict):
+            raise ParseIssue("INVALID_PROFILE", "extra_data 需要为对象")
+        headers = profile.get("headers", {})
+        if not isinstance(headers,dict) or any(not isinstance(key,str) or not isinstance(value,str) for key,value in headers.items()):
+            raise ParseIssue("INVALID_PROFILE", "headers 需要字符串键值对象")
+        expected_content = "application/json" if profile.get("encoding", "json") == "json" else "application/x-www-form-urlencoded"
+        for key,value in headers.items():
+            if key.lower() == "content-type" and value.split(";",1)[0].strip().lower() != expected_content:
+                raise ParseIssue("INVALID_PROFILE", "Content-Type 与 encoding 不一致")
+        success = profile.get("success_fields", {})
+        tokens = profile.get("token_fields", [])
+        required = profile.get("required_token_fields", [])
+        if not isinstance(success,dict) or not isinstance(tokens,list) or not isinstance(required,list):
+            raise ParseIssue("INVALID_PROFILE", "成功规则类型错误")
+        if any(not isinstance(path,str) or not path for path in list(success)+tokens+required):
+            raise ParseIssue("INVALID_PROFILE", "成功字段路径需要非空字符串")
+        self.post_path = endpoint
+        self.request_format = profile.get("encoding", "json")
+        self.username_keyword, self.password_keyword = username,password
+        self.data = data.copy()
+        self.request_headers = headers.copy()
+        self.profile_success_fields = success.copy()
+        self.json_token_fields = tokens[:]
+        self.json_required_nonempty_fields = required[:]
+        Log.Info(f"[*] 使用配置式接口: {endpoint}")
+        return True
+
+    def discover_login_entry(self):
+        if not parserConfig.get("discover_login_links", True):
+            return False
+        soup = BS(self.resp_content, "lxml")
+        if soup.find("input",attrs={"type":lambda value:value and value.lower()=="password"}):
+            return False
+        links = set()
+        for link in soup.find_all("a",href=True):
+            target = urljoin(self.response_url,link["href"])
+            path = urlsplit(target).path
+            if same_origin(self.response_url,target) and target != self.response_url and (
+                re.search(r"/(?:login|signin|sign-in|toLogin)(?:/|$)",path,re.I)
+                or link.get_text(strip=True) in ("登录","登陆","Login","Sign in")
+            ):
+                links.add(target)
+        if not links:
+            return False
+        if len(links) != 1:
+            raise ParseIssue("AMBIGUOUS_ENTRY", "存在多个同源登录入口，请指定登录页地址")
+        endpoint = links.pop()
+        client = self.session if self.session is not None else requests
+        # One linked page only, no crawling or automatic redirect expansion.
+        res = client.get(endpoint,timeout=self.timeout,verify=False,headers=self.headers(),
+                         proxies=self.requests_proxies,allow_redirects=False)
+        if res.status_code != 200:
+            raise ParseIssue("ENTRY_HTTP_ERROR", f"登录页 HTTP {res.status_code}")
+        res.encoding = res.apparent_encoding
+        self.response_url, self.resp_content = endpoint,res.text
+        self.cms = ''
+        Log.Info(f"[*] 发现同源登录页面: {endpoint}")
         return True
 
     def get_resp_content(self):
         client = self.session if self.session is not None else requests
         res = client.get(self.url, timeout=crackConfig["timeout"], verify=False, headers=get_random_headers(),
                            proxies=self.requests_proxies)
+        res.raise_for_status()
         res.encoding = res.apparent_encoding
         self.response_url = res.url
         self.resp_content = res.text
@@ -68,64 +174,24 @@ class Parser:
         """识别静态 fetch + JSON.stringify，不执行 JS，不跨域获取脚本。"""
         if not parserConfig.get("json_login_detection", True):
             return False
-        soup = BS(self.resp_content, "lxml")
-        base = self.response_url
-        origin = urlsplit(base)
-        scripts = [tag.get_text() for tag in soup.find_all("script") if not tag.get("src")]
-        client = self.session if self.session is not None else requests
-        sources = []
-        for tag in soup.find_all("script", src=True):
-            source = urljoin(base, tag["src"])
-            parsed = urlsplit(source)
-            if ((parsed.scheme, parsed.netloc) == (origin.scheme, origin.netloc)
-                    and (tag.get("type", "").lower() == "module" or
-                         any(word in parsed.path.lower() for word in ("auth", "login")))):
-                sources.append(source)
-        for source in list(dict.fromkeys(sources))[:parserConfig.get("json_script_limit", 4)]:
-            try:
-                with client.get(source, timeout=crackConfig["timeout"], verify=False,
-                                proxies=self.requests_proxies, allow_redirects=False, stream=True) as res:
-                    if res.status_code != 200:
-                        continue
-                    maximum = parserConfig.get("json_script_max_bytes", 2097152)
-                    chunks = []
-                    total = 0
-                    for chunk in res.iter_content(8192):
-                        total += len(chunk)
-                        if total > maximum:
-                            break
-                        chunks.append(chunk)
-                    else:
-                        scripts.append(b"".join(chunks).decode("utf-8", errors="replace"))
-            except requests.RequestException:
-                continue
+        scripts = load_scripts(self, parserConfig)
         self.login_scripts = scripts
-        candidates = set()
-        pattern = r"fetch\(\s*(['\"])([^'\"]+)\1\s*,\s*\{([\s\S]{0,3000}?)JSON\.stringify\(\s*\{([^}]+)\}"
-        for script in scripts:
-            for match in re.finditer(pattern, script):
-                path, options, fields = match.group(2, 3, 4)
-                if not re.search(r"method\s*:\s*['\"]POST['\"]", options, re.I):
-                    continue
-                if "application/json" not in options or not re.search(r"login|sign[-_]?in", path, re.I):
-                    continue
-                keys = [piece.strip().split(":", 1)[0].strip("\"'") for piece in fields.split(",")]
-                if not {"username", "password"}.issubset(keys):
-                    continue
-                endpoint = urljoin(base, path)
-                parsed = urlsplit(endpoint)
-                if (parsed.scheme, parsed.netloc) == (origin.scheme, origin.netloc):
-                    candidates.add(endpoint)
-        if not candidates:
-            return self.axios_login_parser(scripts)
-        if len(candidates) != 1:
-            return False
-        self.post_path = candidates.pop()
-        self.username_keyword, self.password_keyword = "username", "password"
-        self.data = {}
-        self.request_format = "json"
-        Log.Info(f"[*] 识别 JSON 登录接口: {self.post_path}")
-        return True
+        self.candidates = discover_candidates(scripts,self.response_url,parserConfig)
+        if len(self.candidates) > 1:
+            raise ParseIssue("AMBIGUOUS_INTERFACE", "多个接口或字段映射候选，请使用 site_profiles 明确指定")
+        if self.candidates:
+            candidate = self.candidates[0]
+            self.post_path,self.request_format = candidate.endpoint,candidate.encoding
+            self.username_keyword,self.password_keyword = candidate.username,candidate.password
+            self.data = candidate.data.copy()
+            # Preserve the stronger, already tested response-wrapper adapter where applicable.
+            if candidate.encoding == "json":
+                endpoint = candidate.endpoint
+                if self.axios_login_parser(scripts) and self.post_path != endpoint:
+                    raise ParseIssue("AMBIGUOUS_INTERFACE", "静态规则与包装器规则指向不同接口")
+            Log.Info(f"[*] 静态接口识别: {self.post_path} ({','.join(candidate.evidence)})")
+            return True
+        return self.axios_login_parser(scripts)
 
     def axios_login_parser(self, scripts):
         """识别 Axios 字面量 baseURL、登录调用链和 Token 响应包装。"""
@@ -202,6 +268,29 @@ class Parser:
                 callback = script[match.end():match.end() + 1200]
                 success = re.match(r"\s*function\s*\(\s*(\w+)[^)]*\)\s*\{\s*if\s*\(\s*\1\.code\s*={2,3}\s*(['\"])200\2\s*\)", callback)
                 candidates.setdefault(endpoint, []).append(bool(success))
+        static_constants, static_objects = environment(self.login_scripts)
+        for script in self.login_scripts:
+            for _, args in calls(script,r"(?:\$|jQuery)\.ajax"):
+                options = object_fields(args[0]) if args else None
+                if not options:
+                    options = static_objects.get(args[0].strip()) if args else None
+                if not options:
+                    continue
+                method = string_value(options.get("method",options.get("type","")),static_constants)
+                serialized = re.fullmatch(r"(?:\$|jQuery)\(\s*(['\"])#([^'\"]+)\1\s*\)\.serialize\(\s*\)",options.get("data", ""))
+                if not method or method.upper() != "POST" or not serialized or serialized[2] != form_id:
+                    continue
+                path = string_value(options.get("url",""),static_constants)
+                if path is None:
+                    continue
+                endpoint = urljoin(base,path)
+                if not same_origin(base,endpoint):
+                    continue
+                callback = options.get("success", "")
+                success = re.match(r"function\s*\(\s*(\w+)[^)]*\)\s*\{\s*if\s*\(\s*\1\.code\s*={2,3}\s*(['\"])200\2\s*\)",callback)
+                candidates.setdefault(endpoint,[]).append(bool(success))
+        if len(candidates) > 1:
+            raise ParseIssue("AMBIGUOUS_INTERFACE", "多个 jQuery 表单提交接口")
         if len(candidates) != 1:
             return False
         self.post_path, rules = next(iter(candidates.items()))
@@ -214,7 +303,7 @@ class Parser:
         soup = BS(self.resp_content, "lxml")
         forms = soup.find_all("form")
         if not forms:
-            raise ValueError("No form found")
+            raise ParseIssue("NO_LOGIN_INTERFACE", "No form found；未找到静态登录接口，可能需要动态执行或 site_profiles 配置")
         # 优先含密码输入框的表单，其次同时含用户名、密码命名的表单。
         for form in forms:
             if form.find("input", attrs={"type": lambda value: value and value.lower() == "password"}):
@@ -236,10 +325,16 @@ class Parser:
         raise Exception("Maybe not login pages")
 
     def captcha_parser(self):
-        captcha_keyword_list = parserConfig["captcha_keyword_list"]
-        for captcha in captcha_keyword_list:
-            if captcha in self.resp_content.lower():
-                raise Exception(f"{captcha} in login page")
+        content = self.form_content if self.form_content else BS(self.resp_content,"lxml")
+        visible = content.get_text(" ",strip=True)
+        attrs = []
+        for tag in content.find_all(True):
+            for name in ("placeholder","alt","aria-label","title","name","id"):
+                attrs.append(str(tag.get(name,"")))
+        haystack = (visible + " " + " ".join(attrs)).casefold()
+        for captcha in parserConfig["captcha_keyword_list"]:
+            if captcha.casefold() in haystack:
+                raise ParseIssue("CAPTCHA_REQUIRED", f"{captcha} in login page")
 
     def post_path_parser(self):
         base_url = getattr(self, "response_url", self.url)
@@ -294,4 +389,4 @@ class Parser:
             self.password_keyword = password_keyword
             self.data = data
         else:
-            raise Exception("Can not get login parameter")
+            raise ParseIssue("UNRESOLVED_FIELDS", "登录字段未确定：请检查前端绑定或配置字段映射")
