@@ -1,10 +1,12 @@
 from urllib.parse import urljoin, urlsplit
 import re
 from copy import deepcopy
-from parse.recognizers import discover_candidates, same_origin, calls, environment, object_fields, string_value
+from parse.recognizers import discover_candidates, same_origin, calls, environment, object_fields, string_value, success_rules
 from parse.resources import load_scripts
+import captcha_solver
 from conf.config import *
 import requests
+from http_requests import TaskStopped, request_with_timeout_retries
 from bs4 import BeautifulSoup as BS
 from generator.header import get_random_headers
 import logs.log as Log
@@ -29,6 +31,10 @@ class Parser:
     password_keyword = ''
     data = ''
     cms = ''
+    captcha_required = False
+    captcha_field = ''
+    captcha_image_url = ''
+    captcha_length = None
 
     def __init__(self, url, session=None):
         self.script_cache = {}
@@ -45,6 +51,10 @@ class Parser:
         self.json_response_success = {}
         self.json_required_nonempty_fields = []
         self.request_format = "form"
+        self.captcha_required = False
+        self.captcha_field = ''
+        self.captcha_image_url = ''
+        self.captcha_length = None
         self.session = session
         self.url = url
         self.requests_proxies = crackConfig["requests_proxies"]
@@ -57,11 +67,13 @@ class Parser:
             self.get_resp_content()
             self.cms_parser()
             if self.json_login_parser():
+                self.captcha_parser(soft=True)
                 self.diagnostic_code = "INTERFACE_FOUND"
                 return True
             if self.discover_login_entry():
                 self.cms_parser()
                 if self.json_login_parser():
+                    self.captcha_parser(soft=True)
                     self.diagnostic_code = "INTERFACE_FOUND"
                     return True
             self.form_parser()
@@ -71,6 +83,8 @@ class Parser:
             self.param_parser()
             self.jquery_login_parser()
             self.diagnostic_code = "FORM_FOUND"
+        except TaskStopped:
+            raise
         except Exception as e:
             self.diagnostic_code = getattr(e, "code", "PAGE_HTTP_ERROR" if isinstance(e,requests.RequestException) else "PARSE_ERROR")
             Log.Error(f"[-] {self.url} Parse Error [{self.diagnostic_code}]: " + str(e))
@@ -100,7 +114,8 @@ class Parser:
         for field in ("post_path", "request_format", "username_keyword", "password_keyword",
                       "data", "request_headers", "cms", "json_token_fields",
                       "profile_success_fields", "json_response_success",
-                      "json_required_nonempty_fields"):
+                      "json_required_nonempty_fields", "captcha_required",
+                      "captcha_field", "captcha_image_url", "captcha_length"):
             setattr(self, field, deepcopy(getattr(template, field)))
         self.script_cache = dict(template.script_cache)
         self.login_scripts = list(template.login_scripts)
@@ -130,12 +145,15 @@ class Parser:
                 self.script_cache.clear()
                 Log.Info(f"[*] 登录页面结构变化，重新识别接口: {self.response_url}")
                 fresh = Parser(self.url, session=self.session)
+                fresh.stop_event = getattr(self, "stop_event", None)
                 result = fresh.run()
                 self.__dict__.clear()
                 self.__dict__.update(fresh.__dict__)
                 return result
             self.diagnostic_code = "PLAN_REFRESHED"
             return True
+        except TaskStopped:
+            raise
         except Exception as exc:
             self.diagnostic_code = getattr(exc, "code", "PAGE_HTTP_ERROR" if isinstance(exc, requests.RequestException) else "PARSE_ERROR")
             Log.Error(f"[-] {self.url} Refresh Error [{self.diagnostic_code}]: {exc}")
@@ -174,6 +192,17 @@ class Parser:
             raise ParseIssue("INVALID_PROFILE", "成功规则类型错误")
         if any(not isinstance(path,str) or not path for path in list(success)+tokens+required):
             raise ParseIssue("INVALID_PROFILE", "成功字段路径需要非空字符串")
+        captcha = profile.get("captcha")
+        if captcha is not None:
+            if not isinstance(captcha, dict) or not captcha.get("field") or not captcha.get("image_url"):
+                raise ParseIssue("INVALID_PROFILE", "captcha 需要 field 与 image_url")
+            if not captchaConfig.get("enable", True):
+                raise ParseIssue("CAPTCHA_REQUIRED", "已通过 --no-captcha 关闭自动验证码识别")
+            if not captcha_solver.available():
+                raise ParseIssue("CAPTCHA_REQUIRED", "ddddocr 未安装或不可用，自动验证码识别不可用")
+            length = captcha.get("length")
+            if length is not None and (isinstance(length, bool) or not isinstance(length, int) or length <= 0):
+                raise ParseIssue("INVALID_PROFILE", "captcha.length 需要正整数")
         self.post_path = endpoint
         self.request_format = profile.get("encoding", "json")
         self.username_keyword, self.password_keyword = username,password
@@ -182,6 +211,11 @@ class Parser:
         self.profile_success_fields = success.copy()
         self.json_token_fields = tokens[:]
         self.json_required_nonempty_fields = required[:]
+        if captcha is not None:
+            self.captcha_required = True
+            self.captcha_field = captcha["field"]
+            self.captcha_image_url = captcha["image_url"]
+            self.captcha_length = captcha.get("length")
         Log.Info(f"[*] 使用配置式接口: {endpoint}")
         return True
 
@@ -207,8 +241,10 @@ class Parser:
         endpoint = links.pop()
         client = self.session if self.session is not None else requests
         # One linked page only, no crawling or automatic redirect expansion.
-        res = client.get(endpoint,timeout=self.timeout,verify=False,headers=self.headers(),
-                         proxies=self.requests_proxies,allow_redirects=False)
+        res = request_with_timeout_retries(
+            lambda: client.get(endpoint, timeout=self.timeout, verify=False, headers=self.headers(),
+                               proxies=self.requests_proxies, allow_redirects=False),
+            context=f"登录入口 GET {endpoint}", stop_event=getattr(self, "stop_event", None))
         if res.status_code != 200:
             raise ParseIssue("ENTRY_HTTP_ERROR", f"登录页 HTTP {res.status_code}")
         res.encoding = res.apparent_encoding
@@ -219,8 +255,10 @@ class Parser:
 
     def get_resp_content(self):
         client = self.session if self.session is not None else requests
-        res = client.get(self.url, timeout=crackConfig["timeout"], verify=False, headers=get_random_headers(),
-                           proxies=self.requests_proxies)
+        res = request_with_timeout_retries(
+            lambda: client.get(self.url, timeout=crackConfig["timeout"], verify=False, headers=get_random_headers(),
+                               proxies=self.requests_proxies),
+            context=f"页面 GET {self.url}", stop_event=getattr(self, "stop_event", None))
         res.raise_for_status()
         res.encoding = res.apparent_encoding
         self.response_url = res.url
@@ -234,6 +272,17 @@ class Parser:
                 if cms['alert']:
                     Log.Info(f"[*] {self.url} {cms['note']}")
                 self.cms = cms
+
+    def _apply_inferred_success_rules(self, sources):
+        """接口未自带响应规则时，从静态回调的显式成功条件补齐判定规则。"""
+        if self.json_response_success:
+            return False
+        rules = success_rules(sources)
+        if not rules:
+            return False
+        self.json_response_success = rules
+        Log.Info(f"[*] 识别静态回调成功规则: {sorted(rules)}")
+        return True
 
     def json_login_parser(self):
         """识别静态 fetch + JSON.stringify，不执行 JS，不跨域获取脚本。"""
@@ -254,6 +303,10 @@ class Parser:
                 endpoint = candidate.endpoint
                 if self.axios_login_parser(scripts) and self.post_path != endpoint:
                     raise ParseIssue("AMBIGUOUS_INTERFACE", "静态规则与包装器规则指向不同接口")
+                # 包装器只补充响应规则；字段映射仍以静态候选为准，避免被覆盖。
+                self.username_keyword, self.password_keyword = candidate.username, candidate.password
+                self.data = candidate.data.copy()
+            self._apply_inferred_success_rules(scripts)
             Log.Info(f"[*] 静态接口识别: {self.post_path} ({','.join(candidate.evidence)})")
             return True
         return self.axios_login_parser(scripts)
@@ -298,14 +351,48 @@ class Parser:
         if all(wrappers):
             self.json_response_success = {"code": [200]}
             self.json_required_nonempty_fields = ["data"]
+        else:
+            self._apply_inferred_success_rules(scripts)
         Log.Info(f"[*] 识别 Axios JSON 登录接口: {self.post_path}")
         return True
+
+    def jquery_ajaxsubmit_parser(self):
+        """识别 jQuery Form Plugin `.ajaxSubmit(callback)` 回调中的成功条件。
+
+        仅采纳回调内明确表达的条件：`ret.success` 为真或 `ret.code == 200`，
+        不执行 JS，也不从响应本体推断成功。
+        """
+        form_id = self.form_content.get("id")
+        call = re.compile(r"\.\s*ajaxSubmit\s*\(\s*function\s*\(\s*([\w$]+)\s*(?:,[^)]*)?\)\s*\{", re.S)
+        selector = re.compile(r"\$\(\s*(['\"])([^'\"]{0,120}?)\1\s*\)\s*$")
+        for script in self.login_scripts:
+            for match in call.finditer(script):
+                head = script[max(0, match.start() - 160):match.start()]
+                selectors = [item.group(2).strip() for item in selector.finditer(head)]
+                if form_id and selectors and not any(
+                        value.lstrip("#") == form_id or value == "form" for value in selectors):
+                    continue
+                parameter = re.escape(match.group(1))
+                body = script[match.end():match.end() + 1500]
+                truthy = re.search(r"(?<![!\w$.])" + parameter + r"\s*\.\s*success\b\s*\)", body)
+                code_ok = re.search(r"(?<![!\w$.])" + parameter
+                                    + r"\s*\.\s*code\b\s*={2,3}\s*['\"]?200['\"]?\s*\)", body)
+                rules = {}
+                if truthy:
+                    rules["success"] = [True]
+                if code_ok:
+                    rules["code"] = [200, "200"]
+                if rules:
+                    self.json_response_success = rules
+                    Log.Info(f"[*] 识别 ajaxSubmit 成功规则: {sorted(rules)}")
+                    return True
+        return False
 
     def jquery_login_parser(self):
         """识别当前表单 serialize() 的 $.post 和字面量 URL，不执行 JS。"""
         form_id = self.form_content.get("id")
         if not form_id:
-            return False
+            return self.jquery_ajaxsubmit_parser()
         constants = {}
         for script in self.login_scripts:
             for match in re.finditer(r"(?:var|let|const)\s+(\w+)\s*=\s*(['\"])([^'\"]*)\2\s*;", script):
@@ -357,10 +444,14 @@ class Parser:
         if len(candidates) > 1:
             raise ParseIssue("AMBIGUOUS_INTERFACE", "多个 jQuery 表单提交接口")
         if len(candidates) != 1:
-            return False
+            return self.jquery_ajaxsubmit_parser()
         self.post_path, rules = next(iter(candidates.items()))
         if all(rules):
             self.json_response_success = {"code": [200, "200"]}
+        else:
+            # 接口已知但回调未给出 code 规则时，补充 ajaxSubmit 与静态回调成功条件。
+            self.jquery_ajaxsubmit_parser()
+            self._apply_inferred_success_rules(self.login_scripts)
         Log.Info(f"[*] 识别 jQuery 表单登录接口: {self.post_path}")
         return True
 
@@ -389,17 +480,126 @@ class Parser:
                 return True
         raise Exception("Maybe not login pages")
 
-    def captcha_parser(self):
-        content = self.form_content if self.form_content else BS(self.resp_content,"lxml")
-        visible = content.get_text(" ",strip=True)
+    @staticmethod
+    def _captcha_haystack(content):
+        """收集表单/页面的可见文本与标识属性；忽略脚本样式内容。"""
+        clone = BS(str(content), "lxml")
+        for tag in clone(["script", "style", "noscript"]):
+            tag.decompose()
+        visible = clone.get_text(" ", strip=True)
         attrs = []
-        for tag in content.find_all(True):
-            for name in ("placeholder","alt","aria-label","title","name","id"):
-                attrs.append(str(tag.get(name,"")))
-        haystack = (visible + " " + " ".join(attrs)).casefold()
-        for captcha in parserConfig["captcha_keyword_list"]:
-            if captcha.casefold() in haystack:
-                raise ParseIssue("CAPTCHA_REQUIRED", f"{captcha} in login page")
+        for tag in clone.find_all(True):
+            for name in ("placeholder", "alt", "aria-label", "title", "name", "id", "class"):
+                value = tag.get(name, "")
+                if isinstance(value, (list, tuple)):
+                    value = " ".join(str(item) for item in value)
+                attrs.append(str(value))
+        return (visible + " " + " ".join(attrs)).casefold()
+
+    @staticmethod
+    def _captcha_name_level(name):
+        """返回 captcha 输入框名称的匹配强度：strong/weak/空。"""
+        if not name:
+            return ""
+        lowered = str(name).casefold()
+        if any(keyword and keyword.casefold() in lowered
+               for keyword in captchaConfig.get("field_keyword_list", [])):
+            return "strong"
+        if any(keyword and keyword.casefold() in lowered
+               for keyword in captchaConfig.get("weak_field_keyword_list", [])):
+            return "weak"
+        return ""
+
+    def _find_captcha_field(self, content):
+        """定位验证码输入字段名；优先强关键字，其次弱关键字。"""
+        names = []
+        for element in content.find_all(["input", "textarea", "select"]):
+            for attribute in ("name", "id"):
+                value = (element.get(attribute) or "").strip()
+                if value and value not in names:
+                    names.append(value)
+        reserved = parserConfig.get("username_keyword_list", []) + parserConfig.get("password_keyword_list", [])
+        for level in ("strong", "weak"):
+            for name in names:
+                if any(keyword and keyword.casefold() in name.casefold() for keyword in reserved):
+                    continue
+                if self._captcha_name_level(name) == level:
+                    return name
+        return ""
+
+    @staticmethod
+    def _captcha_length(content, field):
+        """读取验证码输入框声明的最长长度；页面未声明时为 None。"""
+        if not field:
+            return None
+        for element in content.find_all(["input", "textarea"]):
+            if field in (element.get("name"), element.get("id")):
+                for attribute in ("maxlength", "data-length"):
+                    value = str(element.get(attribute) or "").strip()
+                    if value.isdigit() and 0 < int(value) <= 32:
+                        return int(value)
+                return None
+        return None
+
+    def _find_captcha_image(self, content):
+        """定位验证码图片地址；关键字匹配优先，表单内唯一图片作为后备。"""
+        base = getattr(self, "response_url", self.url)
+        keywords = [keyword for keyword in captchaConfig.get("image_keyword_list", []) if keyword]
+        images = [element for element in content.find_all(["img", "input"])
+                  if element.name == "img" or element.get("type", "").lower() == "image"]
+
+        def resolve(src):
+            # urljoin 对绝对地址、协议相对地址、站内相对路径与 data: URI 均适用。
+            return urljoin(base, src.strip())
+
+        for element in images:
+            src = (element.get("src") or "").strip()
+            if not src:
+                continue
+            marker = " ".join(str(element.get(attr, "")) for attr in
+                              ("src", "id", "class", "alt", "name", "title")).casefold()
+            if any(keyword.casefold() in marker for keyword in keywords):
+                return resolve(src)
+        if content is self.form_content and len(images) == 1:
+            src = (images[0].get("src") or "").strip()
+            if src:
+                return resolve(src)
+        return ""
+
+    def captcha_parser(self, soft=False):
+        """检测验证码；环境支持 ddddocr 时记录识别所需的字段与图片地址。
+
+        检测到验证码但缺少 ddddocr 或定位不到字段/图片时抛出 CAPTCHA_REQUIRED，
+        由调用方放弃该网站。`soft=True` 用于静态接口识别：页面仅提及验证码而
+        定位不到可识别图片时按无验证码处理，避免误跳过可静态提交的接口。
+        """
+        content = self.form_content if self.form_content else BS(self.resp_content, "lxml")
+        haystack = self._captcha_haystack(content)
+        keyword = next((item for item in parserConfig["captcha_keyword_list"]
+                        if item and item.casefold() in haystack), None)
+        self.captcha_required = False
+        if keyword is None:
+            return False
+        field = self._find_captcha_field(content)
+        image_url = self._find_captcha_image(content)
+        if soft and not (field and image_url):
+            Log.Info(f"[*] {self.url} 页面包含验证码关键字，但未定位到可识别图片，按无验证码处理")
+            return False
+        if not captchaConfig.get("enable", True):
+            raise ParseIssue("CAPTCHA_REQUIRED", "已通过 --no-captcha 关闭自动验证码识别")
+        if not captcha_solver.available():
+            raise ParseIssue("CAPTCHA_REQUIRED", "ddddocr 未安装或不可用，自动验证码识别不可用")
+        if not field:
+            raise ParseIssue("CAPTCHA_REQUIRED", "未能定位验证码输入字段")
+        if not image_url:
+            raise ParseIssue("CAPTCHA_REQUIRED", "未能定位验证码图片地址")
+        self.captcha_required = True
+        self.captcha_field = field
+        self.captcha_image_url = image_url
+        self.captcha_length = self._captcha_length(content, field)
+        suffix = f"，长度 {self.captcha_length}" if self.captcha_length else ""
+        Log.Info(f"[*] {self.url} 检测到验证码，使用 ddddocr 自动识别字段 {field}{suffix}")
+        return True
 
     def post_path_parser(self):
         base_url = getattr(self, "response_url", self.url)

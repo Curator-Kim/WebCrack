@@ -17,15 +17,19 @@ WebCrack-plus 是基于 [yzddmr6/WebCrack](https://github.com/yzddmr6/WebCrack)
 | 识别复用 | 缺少任务内接口计划复用机制 | 复用 Axios、jQuery、静态接口、CMS 和站点配置的识别结果；表单动态字段仍刷新，结构变化时重新识别 |
 | 登录接口 | 主要依赖传统 HTML 表单和 CMS 特征 | 增加 fetch、Axios、jQuery 的静态请求识别，同源登录入口发现及精确站点配置 |
 | 成功判断 | 主要参考失败响应长度、关键词及长度复核 | 明确成功证据、失败基线排除、严格 JSON 规则和独立会话复核；长度变化不单独证明成功 |
+| 成功规则来源 | 仅 CMS/配置关键字 | 站点配置 → Axios 包装器 → jQuery 回调 → fetch/axios/\$.ajax 回调的显式成功条件逐级推断；无规则时日志提示，命中记为不确定 |
+| 瞬时错误 | 单次异常即终止该站点 | 登录响应 5xx 与验证码失败有界重试；候选级 5xx 跳过并继续，连续 `server_error_limit` 次才停站；从页面 JS 静态推断 `.ajaxSubmit`/回调的 `success`/`code` 成功规则 |
 | 会话与停止逻辑 | 单任务会话及原有关键词判断 | 工作线程会话隔离、表单 Cookie/隐藏字段刷新；限流、锁定、异常或成功复核后停止提交新候选 |
 | 命令行 | 交互输入 URL 或文件 | 增加 URL/文件、输出、超时、延迟、代理、随机请求头及两级并发参数；保留交互模式 |
 | 结果与日志 | 日期目录日志 | 增加 UTF-8 TSV 成功结果汇总、输入顺序保持、重复 URL 去重、线程局部日志 ID 和日志写入锁 |
 | 请求头 | 静态 UA 列表，并随机设置转发 IP 头 | 使用 fake-useragent 生成 UA；默认不伪造 `X-Forwarded-For` / `Client-IP` |
-| 回归验证 | 缺少当前的自动化检查集 | 76 项回归覆盖解析、判定、并发、识别复用、动态令牌及本地 HTTP；另有 HTML/JSON 集成检查 |
+| 验证码 | 检测到验证码即放弃该站点 | 环境安装 ddddocr 时自动识别图片验证码并注入登录请求；识别失败或未安装时跳过该站点 |
+| 回归验证 | 缺少当前的自动化检查集 | 150 项回归覆盖解析、判定、并发、识别复用、动态令牌、验证码及本地 HTTP；另有 HTML/JSON 集成检查 |
 
 并发并不保证所有站点都更快。页面刷新、网络延迟、连接开销和服务端限制
 都会影响吞吐；本版本使用同步 `requests` 与有界线程池，不是 asyncio 客户端。
-不执行页面 JavaScript，不自动处理验证码、前端密码加密或动态 JSON 令牌刷新。
+不执行页面 JavaScript，不处理前端密码加密或动态 JSON 令牌刷新；验证码仅在安装
+可选依赖 ddddocr 时通过图片识别处理，配置式接口可用 `captcha` 显式声明。
 
 ## 快速开始
 
@@ -72,8 +76,15 @@ python3 webcrack.py
 | `--delay` | 每个请求后的等待秒数；默认配置为 0.03，必须为有限非负数；不是全局限速 |
 | `--proxy` | 完整 HTTP/HTTPS 代理 URL |
 | `--no-random-headers` | 使用配置中的默认请求头 |
+| `--no-captcha` | 不使用 ddddocr 自动识别验证码；需要验证码的站点将被跳过 |
 
 配置项位于 `conf/config.py`，基础密码字典为 `conf/password_list.txt`。
+`crackConfig["server_error_retries"]` 控制登录响应为 5xx 时的额外重试次数（默认 2，
+每次重试都会重新获取并识别验证码），置 0 可关闭。重试后仍为 5xx 时按**候选级**处理：
+跳过该条凭据继续检查，只有连续 `server_error_limit`（默认 3）个候选都只得到 5xx 才放弃该站点，
+以区分“某条凭据触发服务端异常”和“站点整体故障”。429、403 等仍立即停止。
+验证码输入框声明了 `maxlength` 时按声明长度过滤识别结果（如 `maxlength="4"` 只接受 4 位），
+长度不符的值会换图重识别，不再提交给服务端。
 普通及成功日志位于 `logs/{date}/`；汇总输出见下文。
 
 ## 成功结果导出
@@ -105,6 +116,18 @@ jQuery `serialize()` 请求保持表单编码；接口必须同源且映射唯�
 Axios 包装器与 jQuery 成功回调中的已知条件会作为当前接口的判定规则，
 不会将所有站点的 `code=200` 统一视为成功。JSON 规则支持点分隔的嵌套对象路径。
 401 视为凭据失败，429 停止任务；返回 Token 不自动证明权限有效。
+
+所有静态接口（fetch、字面量 axios、`$.ajax`、`$.post`、jQuery Form Plugin）都会额外扫描
+回调中的显式成功条件并登记为响应规则：`if (x.<成功字段>)` → `{字段: true}`、
+`if (!x.<成功字段>)` → `{字段: false}`、`if (x.<字段> === <字面量>)` → `{字段: 字面量}`。
+成功字段名限定在 `SUCCESS_FIELD_NAMES`（success/authenticated/code/status/... ），
+路径相对响应体且最多三段，首段响应变量名会被剥离（`res.data.success` → `data.success`）；
+反向比较（`!==` / `!=`）与未知字段名不登记，避免把无关条件当成成功。
+jQuery Form Plugin 的 `$("#formId").ajaxSubmit(function (res) { ... })` 同样按静态回调处理，
+请求仍提交到表单 `action`。
+页面脚本若既无这些条件、也不符合其它静态子集，响应只能凭 `success_words`、
+`json_success_fields` 或 `site_profiles` 判定。缺少明确规则时结果记为不确定、不导出，
+并在日志中输出 `未获得明确成功规则`；有规则时输出 `成功判定来源: ...` 便于核对。
 
 ## 扩展识别与配置式适配
 
@@ -151,7 +174,8 @@ Axios 包装器与 jQuery 成功回调中的已知条件会作为当前接口的
 找到接口不等于证明身份或权限有效；仅有长度变化、跳转或 Cookie 变化仍不报成功。
 
 典型诊断：`AMBIGUOUS_INTERFACE`（接口/字段映射不唯一）、`AMBIGUOUS_ENTRY`
-（入口不唯一）、`UNRESOLVED_FIELDS`（字段未确定）、`CAPTCHA_REQUIRED`、
+（入口不唯一）、`UNRESOLVED_FIELDS`（字段未确定）、`CAPTCHA_REQUIRED`
+（需要验证码但缺少 ddddocr 或定位不到字段/图片）、
 `NO_LOGIN_INTERFACE`（缺少表单或静态接口）、`INVALID_PROFILE`、`PAGE_HTTP_ERROR`。
 候选及来源证据保存在 `Parser.candidates`，资源读取警告保存在 `resource_warnings`。
 
@@ -162,6 +186,42 @@ python3 -m unittest discover -s checks -p '*regression.py' -v
 python3 -m checks.local_integration
 ```
 
+
+## 验证码识别（可选 ddddocr）
+
+登录页检测到验证码时，只有在当前 Python 环境可导入 ddddocr 且模型可用的情况下
+才自动识别；否则沿用原行为，直接放弃该站点（诊断码 `CAPTCHA_REQUIRED`）。
+通过 `--no-captcha` 可显式关闭识别，同样跳过需要验证码的站点。
+
+```bash
+python3 -m pip install ddddocr        # 可选依赖，安装后自动启用
+python3 webcrack.py -f url.txt        # 检测到验证码时自动识别并注入
+python3 webcrack.py -f url.txt --no-captcha   # 关闭识别，验证码站点跳过
+```
+
+检测与求解流程：
+
+1. 按 `parserConfig["captcha_keyword_list"]` 在表单文本与标识属性中判定是否需要验证码；
+2. 依 `captchaConfig["field_keyword_list"]`（强）与 `weak_field_keyword_list`（弱，如 `code`）
+   定位验证码输入字段，按 `image_keyword_list` 或表单内唯一图片定位图片地址；
+3. 每次登录提交前重新请求验证码图片（相对地址按页面地址解析，支持内联 `data:` URI），
+   串行调用 ddddocr 识别，并按 `min_length`/`max_length` 过滤结果；
+4. 若响应命中 `captcha_fail_words`（如“验证码错误”），重新获取并识别后按
+   `request_retries` 重发，避免把验证码失败误判为密码失败；
+5. `solve_retries` 次仍识别失败时放弃该站点，不将不确定结果导出。
+
+相关配置位于 `conf/config.py` 的 `captchaConfig`。配置式接口（`site_profiles`）可用
+`captcha` 键显式声明字段与图片地址，例如：
+
+```python
+{"page_url": "https://example.test/login", "endpoint": "/session",
+ "username_field": "username", "password_field": "password",
+ "success_fields": {"authenticated": True},
+ "captcha": {"field": "captcha", "image_url": "/captcha.png"}}
+```
+
+OCR 识别存在误差：站点返回的错误提示若不包含验证码关键字，仍可能被归类为密码失败。
+识别能力来自第三方 `ddddocr`，其结果不参与成功判定，成功仍以明确证据和独立会话复核为准。
 
 ## URL 与登录请求并发
 
@@ -243,3 +303,50 @@ JSON 工作线程复用失败请求后的 Cookie；依赖每次请求刷新动�
 ### 2019/09/09 `v(1.0)`
 
 * 项目开源
+
+
+## 有限动态脚本发现
+
+默认启用 `parserConfig["discover_dynamic_scripts"]`。除 `<script src>`、
+modulepreload 和静态 import 外，也提取 HTML 内联脚本中明确创建的 script
+元素的静态 `src`，以及静态数组通过 `forEach` 给 script.src 赋值的路径：
+
+```javascript
+const scripts = ['./assets/components.async.js', './assets/umi.js'];
+scripts.forEach(src => {
+    const script = document.createElement('script');
+    script.src = window.utils.getVersionedUrl(src);
+    document.body.appendChild(script);
+});
+```
+
+支持字面量、已知字符串常量、简单常量拼接及 `getVersionedUrl` 包装中的
+原始路径；版本包装只提取输入路径，不执行函数或保证查询参数相同。
+已下载脚本中的相同加载形式也受 `script_dependency_depth` 限制。
+未知函数、运行时网络结果、加密/计算生成的地址以及 Webpack 数字 chunk 映射
+不猜测；也不会将页面里的所有 `.js` 字符串都当成资源。
+
+所有新路径仍受同源、禁止跟随重定向、资源数量、单文件大小、总读取预算
+和深度限制，并复用任务内资源缓存。默认数量上限仍为 8；资源很多时可按需
+调整。增加资源发现不等于支持跨域 API 或运行时 fetch 拦截器。
+
+
+## 超时与重试
+
+页面 GET、同源登录入口 GET、JS 文件 GET（含流式响应体读取）以及所有登录
+POST（含失败基线和成功复核）统一使用超时重试。默认首次失败后额外重试
+**3 次，最多 4 次尝试**；每次重试前等待 0.3 秒，每轮使用现有 `--timeout`。
+这不是整体截止时间，多轮重试会增加总耗时。
+
+```python
+crackConfig["timeout_retries"] = 3       # 0 可关闭超时重试
+crackConfig["timeout_retry_delay"] = 0.3
+```
+
+只重试连接/读取超时及被 requests 包装为 ConnectionError 的响应体读取超时。
+普通连接失败、TLS 错误、401、429、其他 HTTP 错误、验证码或登录失败不因该
+机制重试。任务停止后取消尚未发起的重试；已发出的请求仍需等待收尾。
+JS 下载超时重试时丢弃部分内容并关闭响应，成功后才缓存完整脚本。
+
+POST 读取超时不代表服务端没有处理请求；重发相同凭据可能重复计入失败次数
+或触发锁定。本机制不保证登录请求幂等，请结合目标限制调整重试和并发数。

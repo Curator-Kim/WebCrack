@@ -279,6 +279,39 @@ class RequestConcurrencyTests(unittest.TestCase):
             self.assertTrue(stop.is_set())
             session.return_value.__exit__.assert_called_once()
 
+    def test_concurrent_credential_500_is_skipped(self):
+        with fixture_settings(2):
+            task = CrackTask()
+            attempts = []
+            workers = {}
+
+            def attempt(username, password, stop):
+                attempts.append(password)
+                worker = SimpleNamespace(stopped=False, recheck=Mock(return_value=True))
+                if password == 'poison':
+                    worker.server_error = True
+                    worker.server_error_status = 500
+                    return LoginState.ERROR, username, password, worker
+                return LoginState.SUCCESS, username, password, worker
+
+            with patch.object(task, '_attempt', side_effect=attempt):
+                self.assertEqual(task.crack_task(['fixture'], ['poison', 'good'])[0], 'fixture')
+            self.assertEqual(attempts, ['poison', 'good'])
+            self.assertFalse(task.stopped)
+
+    def test_concurrent_500_streak_stops_site(self):
+        with fixture_settings(2), patch.dict(crackConfig, {'server_error_limit': 2}):
+            task = CrackTask()
+
+            def attempt(username, password, stop):
+                worker = SimpleNamespace(stopped=False, server_error=True, server_error_status=500,
+                                         recheck=Mock(return_value=True))
+                return LoginState.ERROR, username, password, worker
+
+            with patch.object(task, '_attempt', side_effect=attempt):
+                self.assertEqual(task.crack_task(['fixture'], ['a', 'b', 'c']), (False, False))
+            self.assertTrue(task.stopped)
+
     def test_empty_and_stopped_tasks_send_no_requests(self):
         with fixture_settings(2):
             task = CrackTask()

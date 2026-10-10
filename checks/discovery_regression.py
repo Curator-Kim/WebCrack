@@ -8,9 +8,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import Mock, patch
 
 import requests
-from conf.config import parserConfig, crackConfig
+from conf.config import parserConfig, crackConfig, generatorConfig
 from parse.parser import Parser, ParseIssue
-from parse.recognizers import discover_candidates
+from parse.recognizers import discover_candidates, success_rules
 from parse.resources import load_scripts
 from crack.crack_task import CrackTask, LoginState
 from checks.login_regression import response
@@ -69,6 +69,70 @@ fetch(`${cfg.apiBase}${path}`, {headers:{'Content-Type':'application/json'},
         candidates = self.candidates("axios.post('/login',{username,password});axios.post('/login',{username,password});")
         self.assertEqual(len(candidates),1)
         self.assertEqual(len(candidates[0].evidence),2)
+
+    def test_success_rule_extraction_is_conservative(self):
+        cases = {
+            "const result = await res.json(); if(result.authenticated) go();": {'authenticated': [True]},
+            "if (data.success) { go(); }": {'success': [True]},
+            "if (!json.authenticated) { show(); }": {'authenticated': [False]},
+            "if (data.code === 0) { go(); }": {'code': [0]},
+            "if (data.code == '200') { go(); }": {'code': ['200']},
+            "if (res.data.success === true) { go(); }": {'data.success': [True]},
+            "if (data.status !== false) { go(); }": {},
+            "if (data.code !== 0) { go(); }": {},
+            "if (data.msg === '登录成功') { go(); }": {},
+            "if (rows.length) { go(); }": {},
+            "// if (data.success) {}\nconst s=\"if (data.success)\";": {},
+        }
+        for source, expected in cases.items():
+            with self.subTest(source=source):
+                self.assertEqual(success_rules([source]), expected)
+
+    def test_static_fetch_success_condition_inferred(self):
+        script = ("fetch('/api/login', {method:'POST', headers:{'Content-Type':'application/json'},"
+                  " body:JSON.stringify({username:u.value, password:p.value})})"
+                  ".then(r=>r.json()).then(data=>{ if(data.authenticated) location.href='/home'; });")
+        parser = Parser('https://example.test/login')
+        parser.response_url = parser.url
+        parser.resp_content = ('<form><input name="username"><input type="password" name="password"></form>'
+                               '<script>' + script + '</script>')
+        self.assertTrue(parser.json_login_parser())
+        self.assertEqual(parser.post_path, 'https://example.test/api/login')
+        self.assertEqual(parser.json_response_success, {'authenticated': [True]})
+
+    def test_wrapper_rule_does_not_clobber_static_field_mapping(self):
+        bundle = ("const client=axios.create({baseURL:'/api'});"
+                  "const api={login:async u=>client.post('/login',u)};"
+                  "const model=reactive({username:'',password:''});"
+                  "async function submit(){const token=await api.login(model);localStorage.setItem('token',token);}"
+                  "axios.post('/api/login',{account,passwd});")
+        parser = Parser('https://example.test/page')
+        parser.response_url = parser.url
+        parser.resp_content = ('<form><input name="account"><input type="password" name="passwd"></form>'
+                               '<script>' + bundle + '</script>')
+        self.assertTrue(parser.json_login_parser())
+        self.assertEqual(parser.username_keyword, 'account')
+        self.assertEqual(parser.password_keyword, 'passwd')
+
+    def test_ajax_fixture_detected_without_configured_success_fields(self):
+        from checks.local_sites import running_sites
+        real_session = requests.Session
+
+        def session():
+            client = real_session()
+            client.trust_env = False
+            return client
+
+        with running_sites() as (sites, _events):
+            url = sites['ajax'] + '/login'
+            with patch('requests.session', side_effect=session), \
+                 patch.dict(crackConfig, {'success_words': [], 'json_success_fields': {},
+                                          'delay': 0, 'timeout': 3}), \
+                 patch('crack.crack_task.gen_dict', return_value=(['admin'], ['bad', 'admin123'])), \
+                 patch.dict(generatorConfig['dict_config']['sqlin_dict'], {'enable': False}), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                result = CrackTask().run(1, url)
+            self.assertEqual(result, {'url': url, 'username': 'admin', 'password': 'admin123'})
 
     def test_diagnostic_for_ambiguity(self):
         p = Parser('https://example.test/page')

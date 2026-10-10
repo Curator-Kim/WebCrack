@@ -26,6 +26,17 @@ class AxiosTests(unittest.TestCase):
         p.response_url = p.url
         return p
 
+    def test_success_condition_inferred_without_wrapper(self):
+        script = ("axios.post('/auth/login',{username:u.value,password:p.value})"
+                  ".then(res=>{ if(res.data.success){location.href='/home';}else{show(res.data.message);} });")
+        parser = Parser('http://example.test/login')
+        parser.response_url = parser.url
+        parser.resp_content = ('<form><input name="username"><input type="password" name="password"></form>'
+                               '<script>' + script + '</script>')
+        self.assertTrue(parser.json_login_parser())
+        self.assertEqual(parser.post_path, 'http://example.test/auth/login')
+        self.assertEqual(parser.json_response_success, {'data.success': [True]})
+
     def test_endpoint_and_wrapped_success(self):
         p = self.parser()
         self.assertTrue(p.axios_login_parser([BUNDLE]))

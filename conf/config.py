@@ -21,7 +21,11 @@ crackConfig = {
     "json_token_fields": ["token", "access_token"],  # 顶层非空字符串 Token
     "json_success_fields": {},  # JSON 成功规则，例如 {"authenticated": True}，全部匹配
     "stop_words": ["已被锁定", "密码错误次数过多", "尝试次数", "安全拦截"],
-    "concurrency": 5,  # 每个 URL 同时执行的候选登录请求数
+    "concurrency": 2,  # 每个 URL 同时执行的候选登录请求数
+    "timeout_retries": 3,  # 首次超时后额外重试 3 次，最多 4 次尝试
+    "server_error_retries": 2,  # 登录响应为 5xx 时的额外重试次数（每次重新获取并识别验证码）
+    "server_error_limit": 3,  # 连续多少个候选仅得到 5xx 后放弃该站点（区分单条凭据异常与全站故障）
+    "timeout_retry_delay": 0.3,  # 每次超时重试前等待秒数
     "timeout": 10,  # 超时时间
     "delay": 0.03,  # 每次请求之后sleep的间隔
     "test_username": "admin",  # 测试用户名
@@ -40,7 +44,7 @@ crackConfig = {
 generatorConfig = {
     "dict_config": {
         "base_dict": {
-            "username_list": ['admin'],  # 爆破用户名字典
+            "username_list": ['admin','sgadmin'],  # 爆破用户名字典
             "password_list": txt2list("password_list.txt")  # 爆破密码字典
 
         },
@@ -79,6 +83,7 @@ generatorConfig = {
 }
 parserConfig = {
     "json_login_detection": True,
+    "discover_dynamic_scripts": True,  # 提取明确声明的 script.src 和脚本数组，不执行 JS
     "json_script_limit": 8,
     "script_dependency_depth": 1,
     "script_total_max_bytes": 8388608,
@@ -128,6 +133,57 @@ parserConfig = {
     ],
 
 }
+captchaConfig = {
+    "enable": True,  # 检测到验证码且环境支持 ddddocr 时自动识别；False 时跳过需要验证码的站点
+    "solve_retries": 3,  # 单次登录请求内重新获取并识别验证码的最大次数
+    "request_retries": 3,  # 提交后若明确提示验证码错误，重新识别并重发的最大次数
+    "min_length": 1,  # 识别结果最短长度
+    "max_length": 12,  # 识别结果最长长度
+    "field_keyword_list": [  # 验证码输入框名称/ID 强关键字
+        "captcha",
+        "verify",
+        "vercode",
+        "authcode",
+        "checkcode",
+        "validate",
+        "randcode",
+        "imgcode",
+        "vcode",
+        "yzm",
+        "yanzhengma",
+        "验证码",
+    ],
+    "weak_field_keyword_list": [  # 仅在无强匹配时使用的弱关键字
+        "code",
+    ],
+    "image_keyword_list": [  # 验证码图片 src/id/class/alt 关键字
+        "captcha",
+        "verify",
+        "vercode",
+        "authcode",
+        "checkcode",
+        "validate",
+        "randcode",
+        "imgcode",
+        "vcode",
+        "yzm",
+        "code",
+        "验证码",
+    ],
+    "captcha_fail_words": [  # 明确表示验证码校验未通过的响应关键字
+        "验证码错误",
+        "验证码不正确",
+        "验证码有误",
+        "验证码失效",
+        "验证码已过期",
+        "验证码过期",
+        "验证码输入错误",
+        "验证码不匹配",
+        "captcha error",
+        "invalid captcha",
+    ],
+}
+
 cmsConfig = {
     "discuz": {
         "name": "discuz",  # cms名称
@@ -194,5 +250,6 @@ cliConfig = {
         {"flags": ["--delay"], "type": float, "help": "请求间隔秒数（不小于 0）"},
         {"flags": ["--proxy"], "help": "HTTP/HTTPS 代理 URL"},
         {"flags": ["--no-random-headers"], "action": "store_true", "help": "使用默认请求头"},
+        {"flags": ["--no-captcha"], "action": "store_true", "help": "不使用 ddddocr 自动识别验证码（需要验证码的站点将被跳过）"},
     ],
 }

@@ -31,6 +31,70 @@ class JQueryTests(unittest.TestCase):
         parser.param_parser()
         return parser
 
+    def test_ajaxsubmit_success_rule(self):
+        html = ('<form id="form1" action="/login/loginAjax" method="post">'
+                '<input name="userName"><input type="password" name="userPass"></form>')
+        script = ('$("#form1").ajaxSubmit(function (ret) {\n'
+                  '    Toast(ret.info, 3000);\n'
+                  '    if (ret.success) { setTimeout("btnOpen()", 500); }\n'
+                  '    else { btnValCode(); }\n'
+                  '});')
+        parser = Parser('https://example.test/login')
+        parser.response_url = parser.url
+        parser.resp_content = html
+        parser.login_scripts = [script]
+        parser.form_parser()
+        parser.post_path_parser()
+        parser.param_parser()
+        self.assertTrue(parser.jquery_login_parser())
+        self.assertEqual(parser.post_path, 'https://example.test/login/loginAjax')
+        self.assertEqual(parser.json_response_success, {'success': [True]})
+
+    def test_ajaxsubmit_falsy_or_other_form_ignored(self):
+        html = ('<form id="loginForm" action="/login" method="post">'
+                '<input name="userName"><input type="password" name="userPass"></form>')
+        for script in ('$("#other").ajaxSubmit(function (ret) { if (ret.success) {} });',
+                       '$("#loginForm").ajaxSubmit(function (ret) { if (!ret.success) {} });',
+                       '$("#loginForm").ajaxSubmit(function (ret) { if (ret.success === false) {} });'):
+            with self.subTest(script=script):
+                parser = Parser('https://example.test/login')
+                parser.response_url = parser.url
+                parser.resp_content = html
+                parser.login_scripts = [script]
+                parser.form_parser()
+                parser.post_path_parser()
+                parser.param_parser()
+                self.assertFalse(parser.jquery_ajaxsubmit_parser())
+                self.assertEqual(parser.json_response_success, {})
+
+    def test_ajaxsubmit_code_rule(self):
+        html = ('<form id="form1" action="/login" method="post">'
+                '<input name="user"><input type="password" name="pass"></form>')
+        script = '$("#form1").ajaxSubmit(function (res) { if (res.code === 200) { location.reload(); } });'
+        parser = Parser('https://example.test/login')
+        parser.response_url = parser.url
+        parser.resp_content = html
+        parser.login_scripts = [script]
+        parser.form_parser()
+        parser.post_path_parser()
+        parser.param_parser()
+        self.assertTrue(parser.jquery_ajaxsubmit_parser())
+        self.assertEqual(parser.json_response_success, {'code': [200, '200']})
+
+    def test_post_success_condition_beyond_code(self):
+        script = ("$.post('/xxl-job-admin/login', $('#loginForm').serialize(), function(data) {"
+                  " if (data.success) { location.href='/'; } else { show(data.msg); } });")
+        parser = self.parser(script)
+        self.assertTrue(parser.jquery_login_parser())
+        self.assertEqual(parser.json_response_success, {'success': [True]})
+
+    def test_ajax_success_condition_beyond_code(self):
+        script = ("$.ajax({url:'/xxl-job-admin/login',type:'POST',data:$('#loginForm').serialize(),"
+                  "success:function(ret){ if(ret.authenticated){ location.href='/'; } }});")
+        parser = self.parser(script)
+        self.assertTrue(parser.jquery_login_parser())
+        self.assertEqual(parser.json_response_success, {'authenticated': [True]})
+
     def test_endpoint_rules_and_unchecked_checkbox(self):
         parser = self.parser()
         self.assertTrue(parser.jquery_login_parser())

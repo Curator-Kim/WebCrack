@@ -2,3 +2,6 @@ bs4
 lxml
 requests
 fake-useragent>=2.2,<3
+# 可选：验证码识别。安装 ddddocr 后，需要验证码的登录站点会自动识别；
+# 未安装时，检测到验证码的站点会被跳过（降级处理）。
+# ddddocr

@@ -91,6 +91,34 @@ class LoginTests(unittest.TestCase):
                 contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(self.task.crack_task(['fixture'], ['a', 'b']), ('fixture', 'b'))
 
+    def test_credential_specific_500_is_skipped(self):
+        # 单条凭据触发服务端异常时跳过该候选，继续检查后续候选。
+        with patch.dict(crackConfig, {'server_error_limit': 3}), \
+                patch.object(self.task, 'crack_request',
+                             side_effect=[response('server error', 500), response('密码错误'),
+                                          response('AUTHENTICATED')]), \
+                patch.object(self.task, 'recheck', return_value=True), \
+                contextlib.redirect_stdout(io.StringIO()):
+            result = self.task.crack_task(['fixture'], ['poison', 'b', 'good'])
+        self.assertEqual(result, ('fixture', 'good'))
+        self.assertFalse(self.task.stopped)
+
+    def test_consecutive_500_candidates_stop_site(self):
+        with patch.dict(crackConfig, {'server_error_limit': 2}), \
+                patch.object(self.task, 'crack_request', return_value=response('server error', 500)) as send, \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(self.task.crack_task(['fixture'], ['a', 'b', 'c', 'd']), (False, False))
+        self.assertTrue(self.task.stopped)
+        self.assertEqual(send.call_count, 2)
+
+    def test_non_5xx_error_still_stops_site(self):
+        with patch.dict(crackConfig, {'server_error_limit': 3}), \
+                patch.object(self.task, 'crack_request', return_value=response('forbidden', 403)) as send, \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(self.task.crack_task(['fixture'], ['a', 'b', 'c']), (False, False))
+        self.assertTrue(self.task.stopped)
+        self.assertEqual(send.call_count, 1)
+
     def test_request_preserves_form(self):
         with patch('crack.crack_task.time.sleep'):
             from unittest.mock import Mock

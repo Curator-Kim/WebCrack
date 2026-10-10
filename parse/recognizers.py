@@ -298,6 +298,88 @@ def recognize_jquery(source, page_url, constants, objects, config):
         if candidate: yield candidate
 
 
+# 静态回调中可安全推断的成功字段名；仅这些字段参与规则提取，避免把无关条件当成成功。
+SUCCESS_FIELD_NAMES = (
+    "success", "succeeded", "authenticated", "isauthenticated", "is_authenticated",
+    "islogin", "is_login", "isloggedin", "loggedin", "logged_in", "login",
+    "ok", "code", "status", "statuscode", "status_code", "state",
+    "statecode", "flag", "result", "ret",
+)
+
+_LITERALS = r"(true|false|null|-?\d+(?:\.\d+)?|'[^']*'|\"[^\"]*\")"
+
+
+def _literal_value(token):
+    lowered = token.casefold()
+    if lowered == "true":
+        return True
+    if lowered == "false":
+        return False
+    if lowered == "null":
+        return None
+    if token[:1] in ("'", '"') and token[-1] == token[:1]:
+        return token[1:-1]
+    try:
+        return int(token)
+    except ValueError:
+        try:
+            return float(token)
+        except ValueError:
+            return None
+
+
+def success_rules(sources):
+    """从静态回调中提取显式成功条件，用于严格类型比较的响应判定。
+
+    只采纳 `if (x.<成功字段>)`、`if (!x.<成功字段>)` 与
+    `if (x.<成功字段> === <字面量>)`（含 `==`/`!==`/`!=`）形式，
+    字段路径最多三段，返回 `{路径: [值, ...]}`。不执行 JS。
+    """
+    names = {name.casefold() for name in SUCCESS_FIELD_NAMES}
+    rules = {}
+
+    def accept(expression):
+        parts = [part.strip() for part in expression.split(".") if part.strip()]
+        # 首段是响应变量名（data/res/result...），规则路径相对 JSON 响应体。
+        if len(parts) < 2 or len(parts) > 4 or not all(re.fullmatch(r"[\w$]+", part) for part in parts):
+            return None
+        parts = parts[1:]
+        path = ".".join(parts)
+        if parts[-1].casefold() not in names and path.casefold() not in names:
+            return None
+        return path
+
+    def add(path, value):
+        bucket = rules.setdefault(path, [])
+        if value not in bucket:
+            bucket.append(value)
+
+    path_pattern = r"([\w$]+(?:\s*\.\s*[\w$]+){1,3})"
+    for source in sources:
+        masked = mask(source)
+        for match in re.finditer(r"if\s*\(\s*!\s*" + path_pattern + r"\s*\)", masked):
+            path = accept(match.group(1))
+            if path:
+                add(path, False)
+        for match in re.finditer(r"if\s*\(\s*(?<![!=\w.])" + path_pattern + r"\s*\)", masked):
+            path = accept(match.group(1))
+            if path:
+                add(path, True)
+        for match in re.finditer(r"if\s*\(\s*" + path_pattern + r"\s*(===|==|!==|!=)", masked):
+            path = accept(match.group(1))
+            if not path:
+                continue
+            literal = re.match(r"\s*" + _LITERALS, source[match.end():match.end() + 48])
+            if not literal:
+                continue
+            value = _literal_value(literal.group(1))
+            if match.group(2) in ("!=", "!=="):
+                # 反向比较（含 `!== false`）不是可靠的成功条件，保守跳过。
+                continue
+            add(path, value)
+    return rules
+
+
 RECOGNIZERS = (recognize_fetch, recognize_axios, recognize_jquery)
 
 
