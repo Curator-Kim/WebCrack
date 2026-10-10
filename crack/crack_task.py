@@ -6,6 +6,7 @@ from contextlib import contextmanager
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from enum import Enum
 from parse.recognizers import json_path
+from parse.v2board import response_state as v2board_response_state
 import captcha_solver
 
 
@@ -136,7 +137,9 @@ class CrackTask:
                                   allow_redirects=True, proxies=self.requests_proxies),
                 context=f"登录 POST {path}", stop_event=getattr(self, "_stop_event", None))
             res.encoding = res.apparent_encoding
-            if server_left > 0 and 500 <= res.status_code < 600:
+            known_v2board = (getattr(self.parser, "site_adapter", "") == "v2board"
+                             and v2board_response_state(res) is not None)
+            if server_left > 0 and 500 <= res.status_code < 600 and not known_v2board:
                 server_left -= 1
                 Log.Info(f"[*] {self.url} 登录响应 HTTP {res.status_code}，重新获取验证码后重试")
                 time.sleep(crackConfig["delay"])
@@ -319,6 +322,10 @@ class CrackTask:
             stop_words.append(self.parser.cms["die_flag"])
         if res.status_code == 429 or any(word and word.casefold() in text for word in stop_words):
             return LoginState.STOPPED
+        if getattr(self.parser, "site_adapter", "") == "v2board":
+            state = v2board_response_state(res)
+            if state is not None:
+                return LoginState(state)
         if res.status_code == 401:
             return LoginState.FAILURE
         if not 200 <= res.status_code < 300:

@@ -3,6 +3,7 @@ import re
 from copy import deepcopy
 from parse.recognizers import discover_candidates, same_origin, calls, environment, object_fields, string_value, success_rules
 from parse.resources import load_scripts
+from parse.v2board import recognize_v2board, V2BoardIssue
 import captcha_solver
 from conf.config import *
 import requests
@@ -51,6 +52,7 @@ class Parser:
         self.json_response_success = {}
         self.json_required_nonempty_fields = []
         self.request_format = "form"
+        self.site_adapter = ""
         self.captcha_required = False
         self.captcha_field = ''
         self.captcha_image_url = ''
@@ -115,7 +117,7 @@ class Parser:
                       "data", "request_headers", "cms", "json_token_fields",
                       "profile_success_fields", "json_response_success",
                       "json_required_nonempty_fields", "captcha_required",
-                      "captcha_field", "captcha_image_url", "captcha_length"):
+                      "captcha_field", "captcha_image_url", "captcha_length", "site_adapter"):
             setattr(self, field, deepcopy(getattr(template, field)))
         self.script_cache = dict(template.script_cache)
         self.login_scripts = list(template.login_scripts)
@@ -134,7 +136,7 @@ class Parser:
             changed |= self._script_signature(self.resp_content) != self._script_signature(template.resp_content)
             changed |= tuple(keyword["keywords"] in self.resp_content for keyword in cmsConfig.values()) != tuple(
                 keyword["keywords"] in template.resp_content for keyword in cmsConfig.values())
-            if not changed and self.request_format == "form":
+            if not changed and self.request_format == "form" and not self.site_adapter:
                 self.form_parser()
                 changed = self._form_signature(self.form_content) != self._form_signature(template.form_content)
                 if not changed:
@@ -290,6 +292,23 @@ class Parser:
             return False
         scripts = load_scripts(self, parserConfig)
         self.login_scripts = scripts
+        try:
+            adapter = recognize_v2board(scripts, self.response_url, parserConfig)
+        except V2BoardIssue as exc:
+            raise ParseIssue(exc.code, str(exc)) from exc
+        if adapter:
+            self.post_path = adapter
+            self.request_format = "form"
+            self.username_keyword, self.password_keyword = "email", "password"
+            self.data = {}
+            self.site_adapter = "v2board"
+            self.request_headers = {"Accept": "application/json"}
+            # token 是订阅凭据；auth_data 才是登录会话，避免将订阅 token 当成登录成功。
+            self.profile_success_fields = {}
+            self.json_token_fields = ["data.auth_data"]
+            self.json_required_nonempty_fields = ["data.auth_data"]
+            Log.Info(f"[*] 识别 V2Board 登录接口: {adapter} (email/password, form)")
+            return True
         self.candidates = discover_candidates(scripts,self.response_url,parserConfig)
         if len(self.candidates) > 1:
             raise ParseIssue("AMBIGUOUS_INTERFACE", "多个接口或字段映射候选，请使用 site_profiles 明确指定")

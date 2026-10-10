@@ -19,7 +19,7 @@ class Candidate:
 
 
 def mask(source):
-    """Mask comments and quoted content while preserving offsets and delimiters."""
+    """Mask comments, strings and expression-position regex literals; preserve offsets."""
     out = list(source)
     i = 0
     while i < len(source):
@@ -28,6 +28,33 @@ def mask(source):
             end = len(source) if end < 0 else end + (2 if source[i:i+2] == '/*' else 0)
             out[i:end] = ' ' * (end-i)
             i = end
+        elif source[i] == '/' and re.search(
+                r'(?:^|[=(:,\[!&|?{};])\s*$|\b(?:return|case|throw|yield|typeof|void|delete|in|of|instanceof|await)\s*$',
+                source[max(0, i - 160):i]):
+            # 正则字符类可包含引号、斜杠和括号；这些都不是 JS 字符串/注释。
+            j, in_class = i + 1, False
+            end = None
+            while j < len(source) and source[j] not in '\r\n':
+                char = source[j]
+                if char == '\\':
+                    j += 2
+                    continue
+                if char == '[':
+                    in_class = True
+                elif char == ']':
+                    in_class = False
+                elif char == '/' and not in_class:
+                    j += 1
+                    while j < len(source) and source[j].isalpha():
+                        j += 1
+                    end = j
+                    break
+                j += 1
+            if end is not None:
+                out[i:end] = ' ' * (end - i)
+                i = end
+            else:
+                i += 1  # 未闭合的字面量不扩展到下一行。
         elif source[i] in "'\"`":
             quote = source[i]
             j = i + 1
